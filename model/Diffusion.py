@@ -20,7 +20,8 @@ class Diffusion:
     def noise_time_series(self, x, t):
         sqrt_alpha_hat = torch.sqrt(self.alpha_hat[t])[:, None, None]
         sqrt_one_minus_alpha_hat = torch.sqrt(1. - self.alpha_hat[t])[:, None, None]
-        eps = torch.rand_like(x)
+        #eps = torch.rand_like(x)
+        eps = torch.randn_like(x)
         return sqrt_alpha_hat * x + sqrt_one_minus_alpha_hat * eps, eps
     
     def sample_timesteps(self, n):
