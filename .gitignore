@@ -1,5 +1,4 @@
 **/*.txt
 **/*.png
 trained_models
-datasets
-
+datasets/
