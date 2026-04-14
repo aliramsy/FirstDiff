@@ -663,7 +663,7 @@ class Solver():
             labels = best_labels_final.int().numpy()
             history_flags = history_flags.numpy()
             limit = len(preds)
-            with open(f"{epoch}.txt", "w") as f:
+            with open(f"logs/{epoch}.txt", "w") as f:
 
                 f.write(f"epoch: {epoch}\n")
                 f.write(f"threshold: {best_threshold}\n")
@@ -721,34 +721,67 @@ class Solver():
                             f"epsilon: {total_pred_scores[i]}\n"
                         )
 
-        #if self.history:
-        #    preds = best_raw_predictions.int().numpy()
-        #    labels = best_raw_labels_final.int().numpy()
-        #    limit = len(preds)
-        #    with open(f"0{epoch}.txt", "w") as f:
-#
-        #        f.write(f"epoch: {epoch}\n")
-#
-        #        anomaly_counter = -1
-        #        for i in range(limit):
-        #            if i % 96 == 0:
-        #                anomaly_counter += 1
-#
-        #            if preds[i] == 1 and labels[i] == 0:
-        #                f.write(
-        #                    f"False Positive | index: {i} | "
-        #                    f"history_anomalous: {history_anomalous_counts[anomaly_counter]} | "
-        #                    f"total_scores: {total_cond_scores[i]} | "
-        #                    f"epsilon: {total_pred_scores[i]}\n"
-        #                )
-#
-        #            if preds[i] == 0 and labels[i] == 1:
-        #                f.write(
-        #                    f"False Negative | index: {i} | "
-        #                    f"history_anomalous: {history_anomalous_counts[anomaly_counter]} | "
-        #                    f"total_scores: {total_cond_scores[i]} | "
-        #                    f"epsilon: {total_pred_scores[i]}\n"
-        #                )
+        if self.history:
+            preds = best_raw_predictions.int().numpy()
+            labels = best_raw_labels_final.int().numpy()
+            limit = len(preds)
+            with open(f"rawlogs/{epoch}.txt", "w") as f:
+
+                f.write(f"epoch: {epoch}\n")
+                f.write(f"threshold: {best_threshold}\n")
+
+                anomaly_counter = -1
+                for i in range(limit):
+                    if i % 96 == 0:
+                        anomaly_counter += 1
+
+                    if preds[i] == 1 and labels[i] == 0:
+                        f.write(
+                            f"False Positive | index: {i} | "
+                            f"history_anomalous: {history_anomalous_counts[anomaly_counter]} | "
+                            f"total_cond_scores: {total_scores[i]} | "
+                            f"total_uncond_scores: {total_uncond_cur_scores[i]} | "
+                            f"total_cond_uncond_scores: {total_cond_scores[i]} | "
+                            f"total_half_scores: {total_half_cur_scores[i]} | "
+                            f"total_first_scores: {total_first_cur_scores[i]} | "
+                            f"epsilon: {total_pred_scores[i]}\n"
+                        )
+
+                    if preds[i] == 0 and labels[i] == 1:
+                        f.write(
+                            f"False Negative | index: {i} | "
+                            f"history_anomalous: {history_anomalous_counts[anomaly_counter]} | "
+                            f"total_cond_scores: {total_scores[i]} | "
+                            f"total_uncond_scores: {total_uncond_cur_scores[i]} | "
+                            f"total_cond_uncond_scores: {total_cond_scores[i]} | "
+                            f"total_half_scores: {total_half_cur_scores[i]} | "
+                            f"total_first_scores: {total_first_cur_scores[i]} | "
+                            f"epsilon: {total_pred_scores[i]}\n"
+                        )
+
+                    if preds[i] == 1 and labels[i] == 1:
+                        f.write(
+                            f"True Positive | index: {i} | "
+                            f"history_anomalous: {history_anomalous_counts[anomaly_counter]} | "
+                            f"total_cond_scores: {total_scores[i]} | "
+                            f"total_uncond_scores: {total_uncond_cur_scores[i]} | "
+                            f"total_cond_uncond_scores: {total_cond_scores[i]} | "
+                            f"total_half_scores: {total_half_cur_scores[i]} | "
+                            f"total_first_scores: {total_first_cur_scores[i]} | "
+                            f"epsilon: {total_pred_scores[i]}\n"
+                        )
+
+                    if preds[i] == 0 and labels[i] == 0:
+                        f.write(
+                            f"True Negative | index: {i} | "
+                            f"history_anomalous: {history_anomalous_counts[anomaly_counter]} | "
+                            f"total_cond_scores: {total_scores[i]} | "
+                            f"total_uncond_scores: {total_uncond_cur_scores[i]} | "
+                            f"total_cond_uncond_scores: {total_cond_scores[i]} | "
+                            f"total_half_scores: {total_half_cur_scores[i]} | "
+                            f"total_first_scores: {total_first_cur_scores[i]} | "
+                            f"epsilon: {total_pred_scores[i]}\n"
+                        )
 
 
 
