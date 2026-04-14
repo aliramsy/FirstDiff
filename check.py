@@ -74,10 +74,10 @@ def grid_search_weighted_vote(filepath):
     # 4 Threshold Arrays (4x4x4x4 = 256 combinations)
     # Adjust these based on your specific data ranges
     # ==========================================
-    cond_thresholds   = [ .81]
+    cond_thresholds   = [.7+i/100 for i in range(25)]
     uncond_thresholds = [0.60]
-    half_thresholds   = [.89]
-    eps_thresholds    = [25+i/10 for i in range(90)] 
+    half_thresholds   = [.7+i/100 for i in range(25)]
+    eps_thresholds    = [35+i/10 for i in range(200)] 
     
     combinations = list(itertools.product(cond_thresholds, uncond_thresholds, half_thresholds, eps_thresholds))
     
@@ -95,9 +95,9 @@ def grid_search_weighted_vote(filepath):
         
         # Apply weights: cond gets * 2, others get * 1
         total_votes = vote_cond + 0*vote_uncond + vote_half + vote_eps
-        
+        #total_votes = vote_eps
         # Anomaly if total votes >= 3
-        ensemble_preds = (total_votes >= 1).astype(int)
+        ensemble_preds = (total_votes >= 2).astype(int)
         
         # Apply Point Adjustment
         adj_preds = point_adjustment(gt, ensemble_preds)
