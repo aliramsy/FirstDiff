@@ -243,16 +243,22 @@ class Solver():
                 if self.history:
                     #diff_voutputs = self.denoise_process(i, x, len(self.val_loader), epoch , vhistory)
                     diff_voutputs, diff_voutputs_uncond, predicted_noise, diff_voutputs_cond_half, diff_voutputs_cond_first = self.denoise_process(
-                        i, x, len(self.test_loader), epoch=epoch, history=vhistory, return_uncond=True
+                        i, x, len(self.val_loader), epoch=epoch, history=vhistory, return_uncond=True
                     )
                     pred_eps = predicted_noise.detach()
-                    residual = eps - pred_eps
-                    all_pred_eps.append(pred_eps.reshape(pred_eps.size(0), -1))
-                    all_residuals.append(residual.reshape(residual.size(0), -1))
+
+                    B, T, D = pred_eps.shape
+                    
+                    pred_eps = pred_eps.reshape(B * T, D)
+                    eps_flat = eps.reshape(B * T, D)
+                    residual = eps_flat - pred_eps
+                    
+                    all_pred_eps.append(pred_eps)
+                    all_residuals.append(residual)
                 else:
                     #diff_voutputs = self.denoise_process(i, x, len(self.val_loader), epoch)
                     diff_voutputs, diff_voutputs_uncond, predicted_noise, diff_voutputs_cond_half, diff_voutputs_cond_first = self.denoise_process(
-                        i, x, len(self.test_loader), epoch=epoch, return_uncond= True
+                        i, x, len(self.val_loader), epoch=epoch, return_uncond= True
                     )
 
                 ####### DIFFUSION
@@ -467,9 +473,10 @@ class Solver():
                 all_outputs.append(diff_toutputs.detach().cpu())
 
                 # ======== PCA, Mahalanobis distance ========
-
-                pred_eps = predicted_noise.reshape(predicted_noise.size(0), -1)
-                residual = eps.reshape(eps.size(0), -1) - pred_eps
+                B, T, D = predicted_noise.shape
+                pred_eps = predicted_noise.reshape(B * T, D)
+                eps_flat = eps.reshape(B * T, D)   
+                residual = eps_flat - pred_eps
                 pca1 = torch.matmul(pred_eps - self.mu_eps, self.pca_components[0])
                 pca2 = torch.matmul(pred_eps - self.mu_eps, self.pca_components[1])
                 diff_eps = pred_eps - self.mu_eps
