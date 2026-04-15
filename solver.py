@@ -1,5 +1,7 @@
 import torch.nn.functional as F
 import torch
+from sklearn.decomposition import PCA
+from sklearn.covariance import LedoitWolf
 from torch.utils.tensorboard import SummaryWriter
 from torcheval.metrics.functional import binary_f1_score, binary_precision, binary_recall, binary_auroc
 from model.Diffusion import *
@@ -211,6 +213,9 @@ class Solver():
         if self.history:
             self.history_model.eval()
         running_vloss = 0.0
+        all_pred_eps = []
+        all_residuals = []
+        
         with torch.no_grad():
             for i, vdata in enumerate(self.val_loader):
                 if self.history:
@@ -234,18 +239,66 @@ class Solver():
             
                 ##### DIFFUSION
                 noise_steps = torch.full(size=(ae_x.shape[0],), fill_value=self.diffusion.noise_steps - 1).to(self.device)
-                x, _ = self.diffusion.noise_time_series(ae_x, noise_steps)
+                x, eps = self.diffusion.noise_time_series(ae_x, noise_steps)
                 if self.history:
-                    diff_voutputs = self.denoise_process(i, x, len(self.val_loader), epoch , vhistory)
+                    #diff_voutputs = self.denoise_process(i, x, len(self.val_loader), epoch , vhistory)
+                    diff_voutputs, diff_voutputs_uncond, predicted_noise, diff_voutputs_cond_half, diff_voutputs_cond_first = self.denoise_process(
+                        i, x, len(self.test_loader), epoch=epoch, history=vhistory, return_uncond=True
+                    )
+                    pred_eps = predicted_noise.detach()
+                    residual = eps - pred_eps
+                    all_pred_eps.append(pred_eps.reshape(pred_eps.size(0), -1))
+                    all_residuals.append(residual.reshape(residual.size(0), -1))
                 else:
-                    diff_voutputs = self.denoise_process(i, x, len(self.val_loader), epoch)
+                    #diff_voutputs = self.denoise_process(i, x, len(self.val_loader), epoch)
+                    diff_voutputs, diff_voutputs_uncond, predicted_noise, diff_voutputs_cond_half, diff_voutputs_cond_first = self.denoise_process(
+                        i, x, len(self.test_loader), epoch=epoch, return_uncond= True
+                    )
 
                 ####### DIFFUSION
                 vloss = F.mse_loss(diff_voutputs, ae_x)
                 if self.mask_data:
                     vloss += self.loss_fn(voutputs, vinputs)
-                running_vloss += vloss
-            
+                running_vloss += vloss.item()
+
+        all_pred_eps = torch.cat(all_pred_eps, dim=0)
+        all_residuals = torch.cat(all_residuals, dim=0)
+        # Fit LedoitWolf ONCE
+        lw_eps = LedoitWolf().fit(all_pred_eps.cpu().numpy())
+        
+        # Single consistent mean
+        self.mu_eps = torch.tensor(lw_eps.location_, device=self.device).float()
+        # ===== Mean direction for cosine similarity =====
+        self.mu_eps_dir = self.mu_eps / (torch.norm(self.mu_eps) + 1e-12)
+        
+        # Stable inverse covariance
+        cov_eps = torch.tensor(lw_eps.covariance_, device=self.device).float()
+        
+        # small numerical stabilizer
+        eps_reg = 1e-6
+        cov_eps = cov_eps + eps_reg * torch.eye(cov_eps.size(0), device=self.device)
+        
+        self.inv_cov_eps = torch.inverse(cov_eps)
+        
+        # PCA (centered using SAME mean)
+        centered_eps = all_pred_eps - self.mu_eps
+        pca = PCA(n_components=2)
+        pca.fit(centered_eps.cpu().numpy())
+        
+        self.pca_components = torch.tensor(pca.components_, device=self.device).float()
+
+        # ===============================
+        # 4️⃣ Mahalanobis on residual
+        # ===============================
+        lw_res = LedoitWolf().fit(all_residuals.cpu().numpy())
+        
+        self.mu_res = torch.tensor(lw_res.location_, device=self.device).float()
+        
+        cov_res = torch.tensor(lw_res.covariance_, device=self.device).float()
+        cov_res = cov_res + 1e-6 * torch.eye(cov_res.size(0), device=self.device)
+        
+        self.inv_cov_res = torch.inverse(cov_res)
+
         avg_vloss = running_vloss / len(self.val_loader)
         return avg_vloss
     
@@ -332,6 +385,11 @@ class Solver():
         total_uncond_cur_scores = torch.empty(0).to(self.device)
         total_half_cur_scores = torch.empty(0).to(self.device)
         total_first_cur_scores = torch.empty(0).to(self.device)
+        total_pca1 = torch.empty(0).to(self.device)
+        total_pca2 = torch.empty(0).to(self.device)
+        total_maha_eps = torch.empty(0).to(self.device)
+        total_cos_eps = torch.empty(0).to(self.device)
+        total_maha_res = torch.empty(0).to(self.device)
 
         if self.history:
             history_anomalous_count = 0
@@ -387,11 +445,11 @@ class Solver():
                     thistory = self.history_model(thistory)
 
                 noise_steps = torch.full(
-                    size=(tinputs.shape[0],),
+                    size=(ae_x.shape[0],),
                     fill_value=self.diffusion.noise_steps - 1,
                 ).to(self.device)
 
-                x, _ = self.diffusion.noise_time_series(tinputs, noise_steps)
+                x, eps = self.diffusion.noise_time_series(ae_x, noise_steps)
 
                 if self.history:
                     # Return both conditional and unconditional paths
@@ -400,12 +458,36 @@ class Solver():
                     )
                     diff_toutputs = diff_toutputs_cond # keep for tloss calculation
                 else:
-                    diff_toutputs = self.denoise_process(
-                        i, x, len(self.test_loader), epoch=epoch
+                    diff_toutputs_cond, diff_toutputs_uncond, predicted_noise, diff_toutputs_cond_half, diff_toutputs_cond_first = self.denoise_process(
+                        i, x, len(self.test_loader), epoch=epoch, return_uncond= True
                     )
+                    diff_toutputs = diff_toutputs_cond
 
                 all_inputs.append(tinputs.detach().cpu())
                 all_outputs.append(diff_toutputs.detach().cpu())
+
+                # ======== PCA, Mahalanobis distance ========
+
+                pred_eps = predicted_noise.reshape(predicted_noise.size(0), -1)
+                residual = eps.reshape(eps.size(0), -1) - pred_eps
+                pca1 = torch.matmul(pred_eps - self.mu_eps, self.pca_components[0])
+                pca2 = torch.matmul(pred_eps - self.mu_eps, self.pca_components[1])
+                diff_eps = pred_eps - self.mu_eps
+                maha_eps = torch.sqrt(
+                    torch.einsum('bi,ij,bj->b', diff_eps, self.inv_cov_eps, diff_eps)
+                ) 
+                # ===== Cosine similarity to mean epsilon direction =====
+                pred_eps_norm = pred_eps / (torch.norm(pred_eps, dim=1, keepdim=True) + 1e-12)
+                cos_eps = torch.matmul(pred_eps_norm, self.mu_eps_dir)      
+                diff_res = residual - self.mu_res
+                maha_res = torch.sqrt(
+                    torch.einsum('bi,ij,bj->b', diff_res, self.inv_cov_res, diff_res)
+                )
+                total_pca1 = torch.cat([total_pca1, pca1.reshape(-1)])
+                total_pca2 = torch.cat([total_pca2, pca2.reshape(-1)])
+                total_maha_eps = torch.cat([total_maha_eps, maha_eps.reshape(-1)])
+                total_cos_eps = torch.cat([total_cos_eps, cos_eps.reshape(-1)])
+                total_maha_res = torch.cat([total_maha_res, maha_res.reshape(-1)])
 
                 if self.history:
                     # CFG Divergence: Difference between Conditioned and Unconditioned
@@ -459,7 +541,7 @@ class Solver():
                 if self.mask_data:
                     tloss += self.loss_fn(toutputs, tinputs)
 
-                running_tloss += tloss
+                running_tloss += tloss.item()
 
         avg_tloss = running_tloss / len(self.test_loader)
 
@@ -660,6 +742,11 @@ class Solver():
             total_half_cur_scores = total_half_cur_scores.cpu().numpy()
             total_first_cur_scores = total_first_cur_scores.cpu().numpy()
             total_scores = total_scores.cpu().numpy()
+            total_pca1 = total_pca1.cpu().numpy()
+            total_pca2 = total_pca2.cpu().numpy()
+            total_maha_eps = total_maha_eps.cpu().numpy()
+            total_cos_eps = total_cos_eps.cpu().numpy()
+            total_maha_res = total_maha_res.cpu().numpy()
             labels = best_labels_final.int().numpy()
             history_flags = history_flags.numpy()
             limit = len(preds)
@@ -682,7 +769,12 @@ class Solver():
                             f"total_cond_uncond_scores: {total_cond_scores[i]} | "
                             f"total_half_scores: {total_half_cur_scores[i]} | "
                             f"total_first_scores: {total_first_cur_scores[i]} | "
-                            f"epsilon: {total_pred_scores[i]}\n"
+                            f"epsilon: {total_pred_scores[i]} | "
+                            f"pca1: {total_pca1[i]} | "
+                            f"pca2: {total_pca2[i]} | "
+                            f"maha_eps: {total_maha_eps[i]} | "
+                            f"cos_eps: {total_cos_eps[i]} | "
+                            f"maha_res: {total_maha_res[i]}\n"
                         )
 
                     if preds[i] == 0 and labels[i] == 1:
@@ -694,7 +786,12 @@ class Solver():
                             f"total_cond_uncond_scores: {total_cond_scores[i]} | "
                             f"total_half_scores: {total_half_cur_scores[i]} | "
                             f"total_first_scores: {total_first_cur_scores[i]} | "
-                            f"epsilon: {total_pred_scores[i]}\n"
+                            f"epsilon: {total_pred_scores[i]} | "
+                            f"pca1: {total_pca1[i]} | "
+                            f"pca2: {total_pca2[i]} | "
+                            f"maha_eps: {total_maha_eps[i]} | "
+                            f"cos_eps: {total_cos_eps[i]} | "
+                            f"maha_res: {total_maha_res[i]}\n"
                         )
 
                     if preds[i] == 1 and labels[i] == 1:
@@ -706,7 +803,12 @@ class Solver():
                             f"total_cond_uncond_scores: {total_cond_scores[i]} | "
                             f"total_half_scores: {total_half_cur_scores[i]} | "
                             f"total_first_scores: {total_first_cur_scores[i]} | "
-                            f"epsilon: {total_pred_scores[i]}\n"
+                            f"epsilon: {total_pred_scores[i]} | "
+                            f"pca1: {total_pca1[i]} | "
+                            f"pca2: {total_pca2[i]} | "
+                            f"maha_eps: {total_maha_eps[i]} | "
+                            f"cos_eps: {total_cos_eps[i]} | "
+                            f"maha_res: {total_maha_res[i]}\n"
                         )
 
                     if preds[i] == 0 and labels[i] == 0:
@@ -718,7 +820,12 @@ class Solver():
                             f"total_cond_uncond_scores: {total_cond_scores[i]} | "
                             f"total_half_scores: {total_half_cur_scores[i]} | "
                             f"total_first_scores: {total_first_cur_scores[i]} | "
-                            f"epsilon: {total_pred_scores[i]}\n"
+                            f"epsilon: {total_pred_scores[i]} | "
+                            f"pca1: {total_pca1[i]} | "
+                            f"pca2: {total_pca2[i]} | "
+                            f"maha_eps: {total_maha_eps[i]} | "
+                            f"cos_eps: {total_cos_eps[i]} | "
+                            f"maha_res: {total_maha_res[i]}\n"
                         )
 
         if self.history:
@@ -744,7 +851,12 @@ class Solver():
                             f"total_cond_uncond_scores: {total_cond_scores[i]} | "
                             f"total_half_scores: {total_half_cur_scores[i]} | "
                             f"total_first_scores: {total_first_cur_scores[i]} | "
-                            f"epsilon: {total_pred_scores[i]}\n"
+                            f"epsilon: {total_pred_scores[i]} | "
+                            f"pca1: {total_pca1[i]} | "
+                            f"pca2: {total_pca2[i]} | "
+                            f"maha_eps: {total_maha_eps[i]} | "
+                            f"cos_eps: {total_cos_eps[i]} | "
+                            f"maha_res: {total_maha_res[i]}\n"
                         )
 
                     if preds[i] == 0 and labels[i] == 1:
@@ -756,7 +868,12 @@ class Solver():
                             f"total_cond_uncond_scores: {total_cond_scores[i]} | "
                             f"total_half_scores: {total_half_cur_scores[i]} | "
                             f"total_first_scores: {total_first_cur_scores[i]} | "
-                            f"epsilon: {total_pred_scores[i]}\n"
+                            f"epsilon: {total_pred_scores[i]} | "
+                            f"pca1: {total_pca1[i]} | "
+                            f"pca2: {total_pca2[i]} | "
+                            f"maha_eps: {total_maha_eps[i]} | "
+                            f"cos_eps: {total_cos_eps[i]} | "
+                            f"maha_res: {total_maha_res[i]}\n"
                         )
 
                     if preds[i] == 1 and labels[i] == 1:
@@ -768,7 +885,12 @@ class Solver():
                             f"total_cond_uncond_scores: {total_cond_scores[i]} | "
                             f"total_half_scores: {total_half_cur_scores[i]} | "
                             f"total_first_scores: {total_first_cur_scores[i]} | "
-                            f"epsilon: {total_pred_scores[i]}\n"
+                            f"epsilon: {total_pred_scores[i]} | "
+                            f"pca1: {total_pca1[i]} | "
+                            f"pca2: {total_pca2[i]} | "
+                            f"maha_eps: {total_maha_eps[i]} | "
+                            f"cos_eps: {total_cos_eps[i]} | "
+                            f"maha_res: {total_maha_res[i]}\n"
                         )
 
                     if preds[i] == 0 and labels[i] == 0:
@@ -780,7 +902,12 @@ class Solver():
                             f"total_cond_uncond_scores: {total_cond_scores[i]} | "
                             f"total_half_scores: {total_half_cur_scores[i]} | "
                             f"total_first_scores: {total_first_cur_scores[i]} | "
-                            f"epsilon: {total_pred_scores[i]}\n"
+                            f"epsilon: {total_pred_scores[i]} | "
+                            f"pca1: {total_pca1[i]} | "
+                            f"pca2: {total_pca2[i]} | "
+                            f"maha_eps: {total_maha_eps[i]} | "
+                            f"cos_eps: {total_cos_eps[i]} | "
+                            f"maha_res: {total_maha_res[i]}\n"
                         )
 
 
