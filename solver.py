@@ -248,11 +248,11 @@ class Solver():
                     pred_eps = predicted_noise.detach()
 
                     B, T, D = pred_eps.shape
-                    
+
                     pred_eps = pred_eps.reshape(B * T, D)
                     eps_flat = eps.reshape(B * T, D)
                     residual = eps_flat - pred_eps
-                    
+
                     all_pred_eps.append(pred_eps)
                     all_residuals.append(residual)
                 else:
@@ -294,16 +294,26 @@ class Solver():
         self.pca_components = torch.tensor(pca.components_, device=self.device).float()
 
         # ===============================
-        # 4️⃣ Mahalanobis on residual
+        # 4️⃣ Mahalanobis, Cosine, & PCA on residual
         # ===============================
         lw_res = LedoitWolf().fit(all_residuals.cpu().numpy())
         
         self.mu_res = torch.tensor(lw_res.location_, device=self.device).float()
         
+        # ===== NEW: Mean direction for residual cosine similarity =====
+        self.mu_res_dir = self.mu_res / (torch.norm(self.mu_res) + 1e-12)
+        
         cov_res = torch.tensor(lw_res.covariance_, device=self.device).float()
         cov_res = cov_res + 1e-6 * torch.eye(cov_res.size(0), device=self.device)
         
         self.inv_cov_res = torch.inverse(cov_res)
+
+        # ===== NEW: PCA for residuals (centered using SAME mean) =====
+        centered_res = all_residuals - self.mu_res
+        pca_res = PCA(n_components=2)
+        pca_res.fit(centered_res.cpu().numpy())
+        
+        self.pca_components_res = torch.tensor(pca_res.components_, device=self.device).float()
 
         avg_vloss = running_vloss / len(self.val_loader)
         return avg_vloss
@@ -396,6 +406,10 @@ class Solver():
         total_maha_eps = torch.empty(0).to(self.device)
         total_cos_eps = torch.empty(0).to(self.device)
         total_maha_res = torch.empty(0).to(self.device)
+        total_pca1_res = torch.empty(0).to(self.device)
+        total_pca2_res = torch.empty(0).to(self.device)
+        total_cos_res = torch.empty(0).to(self.device)
+        total_res_scores = torch.empty(0).to(self.device) 
 
         if self.history:
             history_anomalous_count = 0
@@ -477,24 +491,58 @@ class Solver():
                 pred_eps = predicted_noise.reshape(B * T, D)
                 eps_flat = eps.reshape(B * T, D)   
                 residual = eps_flat - pred_eps
+                
+                # Epsilon PCA
                 pca1 = torch.matmul(pred_eps - self.mu_eps, self.pca_components[0])
                 pca2 = torch.matmul(pred_eps - self.mu_eps, self.pca_components[1])
+                
+                # Residual PCA (NEW)
+                pca1_res = torch.matmul(residual - self.mu_res, self.pca_components_res[0])
+                pca2_res = torch.matmul(residual - self.mu_res, self.pca_components_res[1])
+
+                # Epsilon Mahalanobis
                 diff_eps = pred_eps - self.mu_eps
                 maha_eps = torch.sqrt(
                     torch.einsum('bi,ij,bj->b', diff_eps, self.inv_cov_eps, diff_eps)
                 ) 
-                # ===== Cosine similarity to mean epsilon direction =====
+                
+                # ===== Cosine similarity to mean epsilon & residual direction =====
                 pred_eps_norm = pred_eps / (torch.norm(pred_eps, dim=1, keepdim=True) + 1e-12)
                 cos_eps = torch.matmul(pred_eps_norm, self.mu_eps_dir)      
+                
+                res_norm = residual / (torch.norm(residual, dim=1, keepdim=True) + 1e-12)
+                cos_res = torch.matmul(res_norm, self.mu_res_dir) # NEW
+
+                # Residual Mahalanobis
                 diff_res = residual - self.mu_res
                 maha_res = torch.sqrt(
                     torch.einsum('bi,ij,bj->b', diff_res, self.inv_cov_res, diff_res)
                 )
+
+                # Concatenate totals
                 total_pca1 = torch.cat([total_pca1, pca1.reshape(-1)])
                 total_pca2 = torch.cat([total_pca2, pca2.reshape(-1)])
+                total_pca1_res = torch.cat([total_pca1_res, pca1_res.reshape(-1)]) # NEW
+                total_pca2_res = torch.cat([total_pca2_res, pca2_res.reshape(-1)]) # NEW
+                
                 total_maha_eps = torch.cat([total_maha_eps, maha_eps.reshape(-1)])
-                total_cos_eps = torch.cat([total_cos_eps, cos_eps.reshape(-1)])
                 total_maha_res = torch.cat([total_maha_res, maha_res.reshape(-1)])
+                
+                total_cos_eps = torch.cat([total_cos_eps, cos_eps.reshape(-1)])
+                total_cos_res = torch.cat([total_cos_res, cos_res.reshape(-1)]) # NEW
+
+                # ... (Keep your existing CFG divergence code here) ...
+                
+                # Create a score based on magnitude for residual just like you did for pred_noise
+                preds_scores = torch.sum(torch.abs(predicted_noise), dim=2)
+                res_scores = torch.sum(torch.abs(residual.reshape(B, T, D)), dim=2) # NEW
+                
+                total_pred_scores = torch.cat(
+                    [total_pred_scores, preds_scores.reshape(-1)]
+                )
+                total_res_scores = torch.cat(
+                    [total_res_scores, res_scores.reshape(-1)] # NEW
+                )
 
                 if self.history:
                     # CFG Divergence: Difference between Conditioned and Unconditioned
@@ -754,6 +802,10 @@ class Solver():
             total_maha_eps = total_maha_eps.cpu().numpy()
             total_cos_eps = total_cos_eps.cpu().numpy()
             total_maha_res = total_maha_res.cpu().numpy()
+            total_pca1_res = total_pca1_res.cpu().numpy()
+            total_pca2_res = total_pca2_res.cpu().numpy()
+            total_cos_res = total_cos_res.cpu().numpy()
+            total_res_scores = total_res_scores.cpu().numpy()
             labels = best_labels_final.int().numpy()
             history_flags = history_flags.numpy()
             limit = len(preds)
@@ -777,11 +829,15 @@ class Solver():
                             f"total_half_scores: {total_half_cur_scores[i]} | "
                             f"total_first_scores: {total_first_cur_scores[i]} | "
                             f"epsilon: {total_pred_scores[i]} | "
-                            f"pca1: {total_pca1[i]} | "
-                            f"pca2: {total_pca2[i]} | "
+                            f"residual: {total_res_scores[i]} | "
+                            f"pca1_eps: {total_pca1[i]} | "
+                            f"pca2_eps: {total_pca2[i]} | "
+                            f"pca1_res: {total_pca1_res[i]} | "
+                            f"pca2_res: {total_pca2_res[i]} | "
                             f"maha_eps: {total_maha_eps[i]} | "
+                            f"maha_res: {total_maha_res[i]} | "
                             f"cos_eps: {total_cos_eps[i]} | "
-                            f"maha_res: {total_maha_res[i]}\n"
+                            f"cos_res: {total_cos_res[i]}\n"
                         )
 
                     if preds[i] == 0 and labels[i] == 1:
@@ -794,11 +850,15 @@ class Solver():
                             f"total_half_scores: {total_half_cur_scores[i]} | "
                             f"total_first_scores: {total_first_cur_scores[i]} | "
                             f"epsilon: {total_pred_scores[i]} | "
-                            f"pca1: {total_pca1[i]} | "
-                            f"pca2: {total_pca2[i]} | "
+                            f"residual: {total_res_scores[i]} | "
+                            f"pca1_eps: {total_pca1[i]} | "
+                            f"pca2_eps: {total_pca2[i]} | "
+                            f"pca1_res: {total_pca1_res[i]} | "
+                            f"pca2_res: {total_pca2_res[i]} | "
                             f"maha_eps: {total_maha_eps[i]} | "
+                            f"maha_res: {total_maha_res[i]} | "
                             f"cos_eps: {total_cos_eps[i]} | "
-                            f"maha_res: {total_maha_res[i]}\n"
+                            f"cos_res: {total_cos_res[i]}\n"
                         )
 
                     if preds[i] == 1 and labels[i] == 1:
@@ -811,11 +871,15 @@ class Solver():
                             f"total_half_scores: {total_half_cur_scores[i]} | "
                             f"total_first_scores: {total_first_cur_scores[i]} | "
                             f"epsilon: {total_pred_scores[i]} | "
-                            f"pca1: {total_pca1[i]} | "
-                            f"pca2: {total_pca2[i]} | "
+                            f"residual: {total_res_scores[i]} | "
+                            f"pca1_eps: {total_pca1[i]} | "
+                            f"pca2_eps: {total_pca2[i]} | "
+                            f"pca1_res: {total_pca1_res[i]} | "
+                            f"pca2_res: {total_pca2_res[i]} | "
                             f"maha_eps: {total_maha_eps[i]} | "
+                            f"maha_res: {total_maha_res[i]} | "
                             f"cos_eps: {total_cos_eps[i]} | "
-                            f"maha_res: {total_maha_res[i]}\n"
+                            f"cos_res: {total_cos_res[i]}\n"
                         )
 
                     if preds[i] == 0 and labels[i] == 0:
@@ -828,11 +892,15 @@ class Solver():
                             f"total_half_scores: {total_half_cur_scores[i]} | "
                             f"total_first_scores: {total_first_cur_scores[i]} | "
                             f"epsilon: {total_pred_scores[i]} | "
-                            f"pca1: {total_pca1[i]} | "
-                            f"pca2: {total_pca2[i]} | "
+                            f"residual: {total_res_scores[i]} | "
+                            f"pca1_eps: {total_pca1[i]} | "
+                            f"pca2_eps: {total_pca2[i]} | "
+                            f"pca1_res: {total_pca1_res[i]} | "
+                            f"pca2_res: {total_pca2_res[i]} | "
                             f"maha_eps: {total_maha_eps[i]} | "
+                            f"maha_res: {total_maha_res[i]} | "
                             f"cos_eps: {total_cos_eps[i]} | "
-                            f"maha_res: {total_maha_res[i]}\n"
+                            f"cos_res: {total_cos_res[i]}\n"
                         )
 
         if self.history:
@@ -859,11 +927,15 @@ class Solver():
                             f"total_half_scores: {total_half_cur_scores[i]} | "
                             f"total_first_scores: {total_first_cur_scores[i]} | "
                             f"epsilon: {total_pred_scores[i]} | "
-                            f"pca1: {total_pca1[i]} | "
-                            f"pca2: {total_pca2[i]} | "
+                            f"residual: {total_res_scores[i]} | "
+                            f"pca1_eps: {total_pca1[i]} | "
+                            f"pca2_eps: {total_pca2[i]} | "
+                            f"pca1_res: {total_pca1_res[i]} | "
+                            f"pca2_res: {total_pca2_res[i]} | "
                             f"maha_eps: {total_maha_eps[i]} | "
+                            f"maha_res: {total_maha_res[i]} | "
                             f"cos_eps: {total_cos_eps[i]} | "
-                            f"maha_res: {total_maha_res[i]}\n"
+                            f"cos_res: {total_cos_res[i]}\n"
                         )
 
                     if preds[i] == 0 and labels[i] == 1:
@@ -876,11 +948,15 @@ class Solver():
                             f"total_half_scores: {total_half_cur_scores[i]} | "
                             f"total_first_scores: {total_first_cur_scores[i]} | "
                             f"epsilon: {total_pred_scores[i]} | "
-                            f"pca1: {total_pca1[i]} | "
-                            f"pca2: {total_pca2[i]} | "
+                            f"residual: {total_res_scores[i]} | "
+                            f"pca1_eps: {total_pca1[i]} | "
+                            f"pca2_eps: {total_pca2[i]} | "
+                            f"pca1_res: {total_pca1_res[i]} | "
+                            f"pca2_res: {total_pca2_res[i]} | "
                             f"maha_eps: {total_maha_eps[i]} | "
+                            f"maha_res: {total_maha_res[i]} | "
                             f"cos_eps: {total_cos_eps[i]} | "
-                            f"maha_res: {total_maha_res[i]}\n"
+                            f"cos_res: {total_cos_res[i]}\n"
                         )
 
                     if preds[i] == 1 and labels[i] == 1:
@@ -893,11 +969,15 @@ class Solver():
                             f"total_half_scores: {total_half_cur_scores[i]} | "
                             f"total_first_scores: {total_first_cur_scores[i]} | "
                             f"epsilon: {total_pred_scores[i]} | "
-                            f"pca1: {total_pca1[i]} | "
-                            f"pca2: {total_pca2[i]} | "
+                            f"residual: {total_res_scores[i]} | "
+                            f"pca1_eps: {total_pca1[i]} | "
+                            f"pca2_eps: {total_pca2[i]} | "
+                            f"pca1_res: {total_pca1_res[i]} | "
+                            f"pca2_res: {total_pca2_res[i]} | "
                             f"maha_eps: {total_maha_eps[i]} | "
+                            f"maha_res: {total_maha_res[i]} | "
                             f"cos_eps: {total_cos_eps[i]} | "
-                            f"maha_res: {total_maha_res[i]}\n"
+                            f"cos_res: {total_cos_res[i]}\n"
                         )
 
                     if preds[i] == 0 and labels[i] == 0:
@@ -910,11 +990,15 @@ class Solver():
                             f"total_half_scores: {total_half_cur_scores[i]} | "
                             f"total_first_scores: {total_first_cur_scores[i]} | "
                             f"epsilon: {total_pred_scores[i]} | "
-                            f"pca1: {total_pca1[i]} | "
-                            f"pca2: {total_pca2[i]} | "
+                            f"residual: {total_res_scores[i]} | "
+                            f"pca1_eps: {total_pca1[i]} | "
+                            f"pca2_eps: {total_pca2[i]} | "
+                            f"pca1_res: {total_pca1_res[i]} | "
+                            f"pca2_res: {total_pca2_res[i]} | "
                             f"maha_eps: {total_maha_eps[i]} | "
+                            f"maha_res: {total_maha_res[i]} | "
                             f"cos_eps: {total_cos_eps[i]} | "
-                            f"maha_res: {total_maha_res[i]}\n"
+                            f"cos_res: {total_cos_res[i]}\n"
                         )
 
 
