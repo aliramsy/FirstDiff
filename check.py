@@ -100,8 +100,8 @@ def grid_search_weighted_vote(filepath):
         ensemble_preds = (total_votes >= 2).astype(int)
         
         # Apply Point Adjustment
-        adj_preds = point_adjustment(gt, ensemble_preds)
-        
+        #adj_preds = point_adjustment(gt, ensemble_preds)
+        adj_preds = ensemble_preds
         # Calculate metrics
         p = precision_score(gt, adj_preds, zero_division=0)
         r = recall_score(gt, adj_preds, zero_division=0)
