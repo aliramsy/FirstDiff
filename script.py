@@ -22,21 +22,21 @@ RUN = 1
 INFO = f"GAT_SA_EXPTMP_TMPTMP_DEL_RUN_{RUN}"
 D_MODEL = 256
 HISTORY = True
-#TRAIN_PATH = {'MSL': "datasets/MSL/MSL_train.npy", 'SMAP': "datasets/SMAP/SMAP_train.npy", 'SWaT': "datasets/SWaT/swat_train2.csv",
-#            'PSM': "datasets/PSM/train.csv"}
-#TEST_PATH = {'MSL': "datasets/MSL/MSL_test.npy", 'SMAP': "datasets/SMAP/SMAP_test.npy",  'SWaT': "datasets/SWaT/swat2.csv",
-#             'PSM': "datasets/PSM/test.csv"}
-#TEST_LABEL_PATH = {'MSL': "datasets/MSL/MSL_test_label.npy", 'SMAP': "datasets/SMAP/SMAP_test_label.npy",  'SWaT': None,
-#                   'PSM': "datasets/PSM/test_label.csv"}
-#CHANNELS = {'MSL': 55, 'SMAP': 25,  'SWaT': 51, 'PSM': 25}
+TRAIN_PATH = {'SMD': "datasets/SMD/train.npy", 'MSL': "datasets/MSL/MSL_train.npy", 'SMAP': "datasets/SMAP/SMAP_train.npy", 'SWaT': "datasets/SWaT/swat_train2.csv",
+            'PSM': "datasets/PSM/train.csv"}
+TEST_PATH = {'SMD': "datasets/SMD/test.npy", 'MSL': "datasets/MSL/MSL_test.npy", 'SMAP': "datasets/SMAP/SMAP_test.npy",  'SWaT': "datasets/SWaT/swat2.csv",
+             'PSM': "datasets/PSM/test.csv"}
+TEST_LABEL_PATH = {'SMD': "datasets/SMD/test_label.npy", 'MSL': "datasets/MSL/MSL_test_label.npy", 'SMAP': "datasets/SMAP/SMAP_test_label.npy",  'SWaT': None,
+                   'PSM': "datasets/PSM/test_label.csv"}
+CHANNELS = {'SMD': 38,'MSL': 55, 'SMAP': 25,  'SWaT': 51, 'PSM': 25}
 
-TRAIN_PATH = {'SWaT': "datasets/SWaT/swat_train2.csv"}
-TEST_PATH = {'SWaT': "datasets/SWaT/swat2.csv"}
-TEST_LABEL_PATH = {'SWaT': None}
+#TRAIN_PATH = {'SWaT': "datasets/SWaT/swat_train2.csv"}
+#TEST_PATH = {'SWaT': "datasets/SWaT/swat2.csv"}
+#TEST_LABEL_PATH = {'SWaT': None}
 
-CHANNELS = {'SWaT': 51}
+#CHANNELS = {'SWaT': 51}
 
-dataset = "SWaT"
+dataset = "SMD"
 
 if dataset in ['SWaT', 'PSM']:
     train = TrainDatasetCSV(TRAIN_PATH[dataset], None, WINDOW_SIZE, STRIDE, 0.85, HISTORY_SIZE)
@@ -44,8 +44,8 @@ if dataset in ['SWaT', 'PSM']:
     test = TestDatasetCSV(TEST_PATH[dataset], TEST_LABEL_PATH[dataset], None, WINDOW_SIZE, STRIDE, 1.0, HISTORY_SIZE)
 else:
     train = TrainDataset(TRAIN_PATH[dataset], None, WINDOW_SIZE, STRIDE, 0.85, HISTORY_SIZE)
-    val = ValDataset(TRAIN_PATH[dataset], None, WINDOW_SIZE, STRIDE, 0.85, HISTORY_SIZE)
-    test = TestDataset(TEST_PATH[dataset], TEST_LABEL_PATH[dataset], None, WINDOW_SIZE, STRIDE, 1.0, HISTORY_SIZE)
+    val = ValDataset(TRAIN_PATH[dataset], None, WINDOW_SIZE, STRIDE, 0.85, HISTORY_SIZE, scaler=train.scaler)
+    test = TestDataset(TEST_PATH[dataset], TEST_LABEL_PATH[dataset], None, WINDOW_SIZE, STRIDE, HISTORY_SIZE, scaler=train.scaler)
 
 train_dataloader = DataLoader(train, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True)
 val_dataloader = DataLoader(val, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True)

@@ -2,15 +2,12 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 from sklearn.preprocessing import StandardScaler
-
 import os
 import pandas as pd
 
-
 class TrainDataset(Dataset):
     """
-    tmp_threshold - ratio of data to use for training (e.g., 0.8 or 1.0)
-    scaler - Pass an un-fitted StandardScaler. It will be fitted here.
+    Updated to match CSV logic: Returns (sample, history)
     """
     def __init__(self, data_path, transform, window_size, stride, tmp_threshold, history_size, scaler=None):
         self.transform = transform
@@ -18,126 +15,120 @@ class TrainDataset(Dataset):
         self.stride = stride
         self.history_size = history_size
         self.scaler = scaler if scaler is not None else StandardScaler()
-
         data_np = np.load(data_path)
         
-        # Split data before fitting scaler to prevent data leakage
         thre = int(data_np.shape[0] * tmp_threshold)
         train_data_np = data_np[:thre]
         
-        # Fit and transform ONLY on train data
         train_data_scaled = self.scaler.fit_transform(train_data_np)
         self.data = torch.from_numpy(train_data_scaled).type(torch.float32)
         self.dimensions = self.data.shape[1]
         
-        # Valid start indices account for the history size preceding the window
-        max_start_idx = len(self.data) - self.window_size
-        self.start_indices = list(range(self.history_size, max_start_idx + 1, self.stride))
+        # Logic from TrainDatasetCSV
+        self.total_length = self.history_size + self.window_size
+        max_start_idx = len(self.data) - self.total_length
+        self.start_indices = list(range(0, max_start_idx + 1, self.stride))
 
     def __len__(self):
         return len(self.start_indices)
 
     def __getitem__(self, idx):
         start_idx = self.start_indices[idx]
+        hist_end = start_idx + self.history_size
+        sample_end = hist_end + self.window_size
         
-        # Target window ($X_{curr}$)
-        sample = self.data[start_idx : start_idx + self.window_size]
+        history = self.data[start_idx:hist_end]
+        sample = self.data[hist_end:sample_end]
         
-        # History window ($X_{hist}$) strictly preceding the target window
-        history = self.data[start_idx - self.history_size : start_idx]
-
         if self.transform:
             sample = self.transform(sample)
             history = self.transform(history)
-
         return sample, history
-
 
 class ValDataset(Dataset):
     """
-    tmp_threshold - ratio of data used for training (validation takes the rest)
-    scaler - Pass the FITTED scaler from TrainDataset!
+    Updated to match CSV logic: Returns (sample, history)
     """
     def __init__(self, data_path, transform, window_size, stride, tmp_threshold, history_size, scaler):
         self.transform = transform
         self.window_size = window_size
         self.stride = stride
         self.history_size = history_size
-
         data_np = np.load(data_path)
         
-        # Extract validation split (the remaining data after Train)
         thre = int(data_np.shape[0] * tmp_threshold)
         val_data_np = data_np[thre:]
         
-        # Transform using the fitted scaler (DO NOT FIT AGAIN)
         val_data_scaled = scaler.transform(val_data_np)
         self.data = torch.from_numpy(val_data_scaled).type(torch.float32)
         self.dimensions = self.data.shape[1]
         
-        max_start_idx = len(self.data) - self.window_size
-        self.start_indices = list(range(self.history_size, max_start_idx + 1, self.stride))
+        # Logic from ValDatasetCSV
+        self.total_length = self.history_size + self.window_size
+        max_start_idx = len(self.data) - self.total_length
+        self.start_indices = list(range(0, max_start_idx + 1, self.stride))
 
     def __len__(self):
         return len(self.start_indices)
 
     def __getitem__(self, idx):
         start_idx = self.start_indices[idx]
+        hist_end = start_idx + self.history_size
+        sample_end = hist_end + self.window_size
         
-        sample = self.data[start_idx : start_idx + self.window_size]
-        history = self.data[start_idx - self.history_size : start_idx]
-
+        history = self.data[start_idx:hist_end]
+        sample = self.data[hist_end:sample_end]
+        
         if self.transform:
             sample = self.transform(sample)
             history = self.transform(history)
-
         return sample, history
     
-
 class TestDataset(Dataset):
     """
-    Returns sample, history, and labels.
-    scaler - Pass the FITTED scaler from TrainDataset!
+    Updated to match CSV logic: Returns (sample, history, labels, hist_labels)
     """
     def __init__(self, data_path, labels_path, transform, window_size, stride, history_size, scaler):
         self.transform = transform
         self.window_size = window_size
         self.stride = stride
         self.history_size = history_size
-
-        # Assuming test data is a separate file, load the whole thing.
-        test_data_np = np.load(data_path)
         
-        # Transform using the fitted scaler from training
+        test_data_np = np.load(data_path)
         test_data_scaled = scaler.transform(test_data_np)
         self.data = torch.from_numpy(test_data_scaled).type(torch.float32)
         
-        # Load labels 
         labels_np = np.load(labels_path)
-        self.labels = torch.from_numpy(labels_np).type(torch.float32)
+        # Reshape to match CSV's .reshape(-1) behavior for consistency
+        self.labels = torch.from_numpy(labels_np).reshape(-1).type(torch.float32)
         self.dimensions = self.data.shape[1]
         
-        # Ensure labels and data lengths match
         assert len(self.data) == len(self.labels), "Test data and labels must have the same length!"
         
-        max_start_idx = len(self.data) - self.window_size
-        self.start_indices = list(range(self.history_size, max_start_idx + 1, self.stride))
+        # Logic from TestDatasetCSV
+        self.total_length = self.history_size + self.window_size
+        max_start_idx = len(self.data) - self.total_length
+        self.start_indices = list(range(0, max_start_idx + 1, self.stride))
 
     def __len__(self):
         return len(self.start_indices)
 
     def __getitem__(self, idx):
         start_idx = self.start_indices[idx]
+        hist_end = start_idx + self.history_size
+        sample_end = hist_end + self.window_size
         
-        sample = self.data[start_idx : start_idx + self.window_size]
-        history = self.data[start_idx - self.history_size : start_idx]
-        labels = self.labels[start_idx : start_idx + self.window_size]
-
+        history = self.data[start_idx:hist_end]
+        sample = self.data[hist_end:sample_end]
+        
+        # Labels logic from TestDatasetCSV
+        labels = self.labels[hist_end:sample_end]
+        hist_labels = self.labels[start_idx:hist_end]
+        
         if self.transform:
             sample = self.transform(sample)
             history = self.transform(history)
-
-        return sample, history, labels
+        return sample, history, labels, hist_labels
     
 class TrainDatasetCSV(Dataset):
     """

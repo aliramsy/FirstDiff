@@ -809,7 +809,7 @@ class Solver():
             labels = best_labels_final.int().numpy()
             history_flags = history_flags.numpy()
             limit = len(preds)
-            with open(f"logs/{epoch}.txt", "w") as f:
+            with open(f"smdlogs/{epoch}.txt", "w") as f:
 
                 f.write(f"epoch: {epoch}\n")
                 f.write(f"threshold: {best_threshold}\n")
@@ -907,7 +907,7 @@ class Solver():
             preds = best_raw_predictions.int().numpy()
             labels = best_raw_labels_final.int().numpy()
             limit = len(preds)
-            with open(f"rawlogs/{epoch}.txt", "w") as f:
+            with open(f"smdrawlogs/{epoch}.txt", "w") as f:
 
                 f.write(f"epoch: {epoch}\n")
                 f.write(f"threshold: {best_threshold}\n")
