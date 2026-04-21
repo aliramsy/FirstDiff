@@ -8,10 +8,10 @@ from model.Diffusion import *
 
 class Solver():
     # add autoencoder to the init function it is after self
-    def __init__(self, history_model, diff_model, train_loader, val_loader, test_loader, diffusion=None, mask_data=True, anomaly_ratio=0.05, experiment=None, history = True, device='cuda', gpu_id=0):
+    def __init__(self, decomposer, diff_model, train_loader, val_loader, test_loader, diffusion=None, mask_data=True, anomaly_ratio=0.05, experiment=None, device='cuda', gpu_id=0):
         #self.autoencoder = autoencoder
-        self.history_model = history_model
-        self.history = history
+        self.decomposer = decomposer
+        self.mask_data = mask_data
         self.diff_model = diff_model
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -20,7 +20,6 @@ class Solver():
         self.anomaly_ratio = anomaly_ratio
         self.alpha = 10
         self.diffusion = diffusion
-        self.mask_data = mask_data
         self.experiment_name = f"runs/AE_diff_{experiment['dataset']}_noise({experiment['noise_steps']})_epochs({experiment['epochs']})_batch({experiment['batch_size']})_window({experiment['window_size']})_{experiment['info']}"
         self.model_name = f"AE_diff_{experiment['dataset']}_noise({experiment['noise_steps']})_epochs({experiment['epochs']})_batch({experiment['batch_size']})_window({experiment['window_size']})_{experiment['info']}"
         
@@ -49,10 +48,8 @@ class Solver():
         
 
         for i, data in enumerate(self.train_loader):
-            if self.history:
-                inputs, history = data[0].to(self.device), data[1].to(self.device)
-            else: 
-                inputs, _ = data[0].to(self.device), data[1].to(self.device)
+            inputs= data
+            inputs = inputs.to(self.device)
             
             self.optimizer.zero_grad()
             
@@ -67,25 +64,29 @@ class Solver():
             else:
                 ae_x = inputs
 
-            ##### HISTORY
-            if self.history:
-                history = self.history_model(history)
+            if self.decomposer:
+                x_low, x_mid, x_high = self.decomposer(ae_x)
+                x_low = x_low.to(self.device)
+                x_mid = x_mid.to(self.device)
+                x_high = x_high.to(self.device)
 
             ##### DIFFUSION
-            t = self.diffusion.sample_timesteps(ae_x.shape[0]).to(self.device)
-            x_t, noise = self.diffusion.noise_time_series(ae_x, t)
+            t = self.diffusion.sample_timesteps(x_high.shape[0]).to(self.device)
+            x_t, noise = self.diffusion.noise_time_series(x_high, t)
             #predicted_noise = self.diff_model(x_t, t, ae_x)
-            if self.history:
-                # Add drop_prob (e.g., 10%) for CFG training
-                predicted_noise = self.diff_model(x_t, t, c_hist=history, drop_prob=0.2)
+            if self.decomposer:
+                predicted_noise = self.diff_model(x_curr=x_t, t=t, c_mid=x_mid, coarse=x_low)
             else:
                 predicted_noise = self.diff_model(x_t, t)
 
 
             diff_loss = self.loss_fn(predicted_noise, noise)
             ####### DIFFUSION
+            if self.mask_data:
+                loss = self.alpha * diff_loss
+            else:
+                loss = diff_loss
 
-            loss = self.alpha * diff_loss
             if self.mask_data:
                 loss += self.loss_fn(outputs, inputs)
 
@@ -101,22 +102,14 @@ class Solver():
     def train(self, epochs):
         #self.autoencoder.to(self.device)
         self.diff_model.to(self.device)
-        #self.optimizer = torch.optim.Adam(list(self.autoencoder.parameters()) + list(self.diff_model.parameters()), lr=1e-3)
-        if self.history:
-            self.history_model.to(self.device)
-            self.optimizer = torch.optim.Adam(
-                list(self.diff_model.parameters()) + list(self.history_model.parameters()), 
-                lr=1e-3
-            )
+        if self.mask_data:
+            self.optimizer = torch.optim.Adam(list(self.autoencoder.parameters()) + list(self.diff_model.parameters()), lr=1e-3)
         else:
-            self.optimizer = torch.optim.Adam(list(self.diff_model.parameters()), lr=1e-3)
-
+            self.optimizer = torch.optim.Adam(self.diff_model.parameters(), lr=1e-3)
 
         for epoch in range(epochs):
             #self.autoencoder.train()
             self.diff_model.train()
-            if self.history:
-                self.history_model.train()
 
             avg_loss = self.train_one_epoch(epoch)
  
@@ -129,99 +122,56 @@ class Solver():
             #    self.save_model([f'AE_{epoch}', f'Diffusion_{epoch}'])
 
         self.tb_writer.flush()
-        self.save_model([f'History{epoch}', f'Diffusion_{epoch}'])
+        self.save_model(f'Diffusion_{epoch}')
 
-    def denoise_process_old(self, i, x, batch_num = 128, epoch=None, history = None):
+    
+    def denoise_process(self, i, x, x_mid, x_low, batch_num=128, epoch=None):
+
         for j in range(self.diffusion.noise_steps - 1, -1, -1):
             t = (j * torch.ones(x.shape[0])).long().to(self.device)       
             self.diff_model.eval()
-            if self.history:
-                self.history_model.eval()
-       
-            #predicted_noise = self.diff_model(x, t, x)
-            if self.history:
-                predicted_noise = self.diff_model(x, t, history)
-            else:
-                predicted_noise = self.diff_model(x, t)
+
+            predicted_noise = self.diff_model(x_curr=x, t=t, c_mid=x_mid, coarse=x_low)
+            if j == self.diffusion.noise_steps - 1:
+                ret_predicted_noise_cond = predicted_noise.clone()
 
             if j % 100 == 0:
                 print(f"Epoch: {epoch}, Batch No. {i}, Denoise step: {j}, Total Batches: {batch_num}")
+            
             alpha = self.diffusion.alpha[t][:, None, None]
             alpha_hat = self.diffusion.alpha_hat[t][:, None, None]
             beta = self.diffusion.beta[t][:, None, None]
+            
             if j > 0:
                 noise = torch.randn_like(x)
             else:
                 noise = torch.zeros_like(x)
+            
             x = 1 / torch.sqrt(alpha) * (x - ((1 - alpha) / (torch.sqrt(1 - alpha_hat))) * predicted_noise) + torch.sqrt(beta) * noise
-        return x
-    
-    def denoise_process(self, i, x, batch_num=128, epoch=None, history=None, return_uncond=False):
-        x_cond = x.clone()
-        if return_uncond and self.history:
-            x_uncond = x.clone()
-
-        for j in range(self.diffusion.noise_steps - 1, -1, -1):
-            t = (j * torch.ones(x.shape[0])).long().to(self.device)       
-            self.diff_model.eval()
-            if self.history:
-                self.history_model.eval()
-       
-            # 1. Get conditioned noise
-            if self.history:
-                predicted_noise_cond = self.diff_model(x_cond, t, history)
-                if j == self.diffusion.noise_steps - 1:
-                    ret_predicted_noise_cond = predicted_noise_cond.clone()
-            else:
-                predicted_noise_cond = self.diff_model(x_cond, t)
-
-            # 2. Get unconditioned noise (if requested)
-            if return_uncond and self.history:
-                predicted_noise_uncond = self.diff_model(x_uncond, t, c_hist=None)
-
-            if j % 100 == 0:
-                print(f"Epoch: {epoch}, Batch No. {i}, Denoise step: {j}, Total Batches: {batch_num}")
-            
-            alpha = self.diffusion.alpha[t][:, None, None]
-            alpha_hat = self.diffusion.alpha_hat[t][:, None, None]
-            beta = self.diffusion.beta[t][:, None, None]
-            
-            if j > 0:
-                noise = torch.randn_like(x_cond) # Use same noise for both paths
-            else:
-                noise = torch.zeros_like(x_cond)
-            
-            # Step conditioned x
-            x_cond = 1 / torch.sqrt(alpha) * (x_cond - ((1 - alpha) / (torch.sqrt(1 - alpha_hat))) * predicted_noise_cond) + torch.sqrt(beta) * noise
             
             if j == int(self.diffusion.noise_steps/2):
-                ret_half_noise = x_cond.clone()
+                ret_half_noise = x.clone()
+                ret_half_noise = x_low + x_mid + ret_half_noise
             if j == self.diffusion.noise_steps - 1:
-                ret_first_noise = x_cond.clone()
-            # Step unconditioned x
-            if return_uncond and self.history:
-                x_uncond = 1 / torch.sqrt(alpha) * (x_uncond - ((1 - alpha) / (torch.sqrt(1 - alpha_hat))) * predicted_noise_uncond) + torch.sqrt(beta) * noise
+                ret_first_noise = x.clone()
+                ret_first_noise = x_low + x_mid + ret_first_noise
+        x = x + x_low + x_mid
 
-        if return_uncond and self.history:
-            return x_cond, x_uncond, ret_predicted_noise_cond, ret_half_noise, ret_first_noise
-        return x_cond
+        return x, ret_predicted_noise_cond, ret_half_noise, ret_first_noise
 
     
     def val(self, epoch=0):
         #self.autoencoder.eval()
         self.diff_model.eval()
-        if self.history:
-            self.history_model.eval()
+
         running_vloss = 0.0
         all_pred_eps = []
         all_residuals = []
         
         with torch.no_grad():
             for i, vdata in enumerate(self.val_loader):
-                if self.history:
-                    vinputs, vhistory = vdata[0].to(self.device), vdata[1].to(self.device)
-                else:
-                    vinputs, _ = vdata[0].to(self.device), vdata[1].to(self.device)
+                vinputs = vdata
+                vinputs = vinputs.to(self.device)
 
                 if self.mask_data:
                     #voutputs = self.autoencoder(vinputs)
@@ -233,33 +183,27 @@ class Solver():
                     ae_x = mask * vinputs + (1. - mask) * torch.rand_like(vinputs)
                 else:
                     ae_x = vinputs
-                # HISTORY
-                if self.history:
-                    vhistory = self.history_model(vhistory)
             
                 ##### DIFFUSION
-                noise_steps = torch.full(size=(ae_x.shape[0],), fill_value=self.diffusion.noise_steps - 1).to(self.device)
-                x, eps = self.diffusion.noise_time_series(ae_x, noise_steps)
-                if self.history:
-                    #diff_voutputs = self.denoise_process(i, x, len(self.val_loader), epoch , vhistory)
-                    diff_voutputs, diff_voutputs_uncond, predicted_noise, diff_voutputs_cond_half, diff_voutputs_cond_first = self.denoise_process(
-                        i, x, len(self.val_loader), epoch=epoch, history=vhistory, return_uncond=True
-                    )
-                    pred_eps = predicted_noise.detach()
+                if self.decomposer:
+                    x_low, x_mid, x_high = self.decomposer(ae_x)
+                    x_low = x_low.to(self.device)
+                    x_mid = x_mid.to(self.device)
+                    x_high = x_high.to(self.device)
 
-                    B, T, D = pred_eps.shape
+                noise_steps = torch.full(size=(x_high.shape[0],), fill_value=self.diffusion.noise_steps - 1).to(self.device)
+                x, eps = self.diffusion.noise_time_series(x_high, noise_steps)
 
-                    pred_eps = pred_eps.reshape(B * T, D)
-                    eps_flat = eps.reshape(B * T, D)
-                    residual = eps_flat - pred_eps
-
-                    all_pred_eps.append(pred_eps)
-                    all_residuals.append(residual)
-                else:
-                    #diff_voutputs = self.denoise_process(i, x, len(self.val_loader), epoch)
-                    diff_voutputs, diff_voutputs_uncond, predicted_noise, diff_voutputs_cond_half, diff_voutputs_cond_first = self.denoise_process(
-                        i, x, len(self.val_loader), epoch=epoch, return_uncond= True
-                    )
+                diff_voutputs, predicted_noise, diff_voutputs_cond_half, diff_voutputs_cond_first = self.denoise_process(
+                    i, x, x_mid, x_low, len(self.val_loader), epoch=epoch
+                )
+                pred_eps = predicted_noise.detach()
+                B, T, D = pred_eps.shape
+                pred_eps = pred_eps.reshape(B * T, D)
+                eps_flat = eps.reshape(B * T, D)
+                residual = eps_flat - pred_eps
+                all_pred_eps.append(pred_eps)
+                all_residuals.append(residual)
 
                 ####### DIFFUSION
                 vloss = F.mse_loss(diff_voutputs, ae_x)
@@ -285,13 +229,6 @@ class Solver():
         cov_eps = cov_eps + eps_reg * torch.eye(cov_eps.size(0), device=self.device)
         
         self.inv_cov_eps = torch.inverse(cov_eps)
-        
-        # PCA (centered using SAME mean)
-        centered_eps = all_pred_eps - self.mu_eps
-        pca = PCA(n_components=2)
-        pca.fit(centered_eps.cpu().numpy())
-        
-        self.pca_components = torch.tensor(pca.components_, device=self.device).float()
 
         # ===============================
         # 4️⃣ Mahalanobis, Cosine, & PCA on residual
@@ -307,13 +244,6 @@ class Solver():
         cov_res = cov_res + 1e-6 * torch.eye(cov_res.size(0), device=self.device)
         
         self.inv_cov_res = torch.inverse(cov_res)
-
-        # ===== NEW: PCA for residuals (centered using SAME mean) =====
-        centered_res = all_residuals - self.mu_res
-        pca_res = PCA(n_components=2)
-        pca_res.fit(centered_res.cpu().numpy())
-        
-        self.pca_components_res = torch.tensor(pca_res.components_, device=self.device).float()
 
         avg_vloss = running_vloss / len(self.val_loader)
         return avg_vloss
@@ -396,26 +326,15 @@ class Solver():
         running_tloss = 0.0
         total_scores = torch.empty(0).to(self.device)
         total_labels = torch.empty(0).to(self.device)
-        total_cond_scores = torch.empty(0).to(self.device)
         total_pred_scores = torch.empty(0).to(self.device)
-        total_uncond_cur_scores = torch.empty(0).to(self.device)
         total_half_cur_scores = torch.empty(0).to(self.device)
         total_first_cur_scores = torch.empty(0).to(self.device)
-        total_pca1 = torch.empty(0).to(self.device)
-        total_pca2 = torch.empty(0).to(self.device)
         total_maha_eps = torch.empty(0).to(self.device)
         total_cos_eps = torch.empty(0).to(self.device)
         total_maha_res = torch.empty(0).to(self.device)
-        total_pca1_res = torch.empty(0).to(self.device)
-        total_pca2_res = torch.empty(0).to(self.device)
         total_cos_res = torch.empty(0).to(self.device)
         total_res_scores = torch.empty(0).to(self.device) 
 
-        if self.history:
-            history_anomalous_count = 0
-            history_normal_count = 0
-            history_flags = []
-            history_anomalous_counts = []
 
         all_inputs = []
         all_outputs = []
@@ -423,27 +342,9 @@ class Solver():
         with torch.no_grad():
             for i, tdata in enumerate(self.test_loader):
 
-                if self.history:
-                    tinputs, thistory, labels, hist_labels = (
-                        tdata[0].to(self.device),
-                        tdata[1].to(self.device),
-                        tdata[2].to(self.device),
-                        tdata[3].to(self.device),
-                    )
-                    history_anomalous_counts.extend((hist_labels > 0).sum(dim=1).tolist())
-                    history_is_anomalous = (hist_labels.sum(dim=1) > 0)
-
-                    history_anomalous_count += history_is_anomalous.sum().item()
-                    history_normal_count += (history_is_anomalous == 0).sum().item()
-
-                    history_flags.append(history_is_anomalous.detach().cpu())
-                else: 
-                    tinputs, _, labels, _ = (
-                        tdata[0].to(self.device),
-                        tdata[1].to(self.device),
-                        tdata[2].to(self.device),
-                        tdata[3].to(self.device),
-                    )
+                tinputs, labels = tdata[0], tdata[1]
+                tinputs = tinputs.to(self.device)
+                labels = labels.to(self.device)
 
                 if self.mask_data:
                     #toutputs = self.autoencoder(tinputs)
@@ -461,29 +362,25 @@ class Solver():
                 else:
                     ae_x = tinputs
 
-                if self.history:
-                    thistory = self.history_model(thistory)
+                if self.decomposer:
+                    x_low, x_mid, x_high = self.decomposer(ae_x)
+                    x_low = x_low.to(self.device)
+                    x_mid = x_mid.to(self.device)
+                    x_high = x_high.to(self.device)
 
                 noise_steps = torch.full(
-                    size=(ae_x.shape[0],),
+                    size=(x_high.shape[0],),
                     fill_value=self.diffusion.noise_steps - 1,
                 ).to(self.device)
 
-                x, eps = self.diffusion.noise_time_series(ae_x, noise_steps)
+                x, eps = self.diffusion.noise_time_series(x_high, noise_steps)
 
-                if self.history:
-                    # Return both conditional and unconditional paths
-                    diff_toutputs_cond, diff_toutputs_uncond, predicted_noise, diff_toutputs_cond_half, diff_toutputs_cond_first = self.denoise_process(
-                        i, x, len(self.test_loader), epoch=epoch, history=thistory, return_uncond=True
-                    )
-                    diff_toutputs = diff_toutputs_cond # keep for tloss calculation
-                else:
-                    diff_toutputs_cond, diff_toutputs_uncond, predicted_noise, diff_toutputs_cond_half, diff_toutputs_cond_first = self.denoise_process(
-                        i, x, len(self.test_loader), epoch=epoch, return_uncond= True
-                    )
-                    diff_toutputs = diff_toutputs_cond
+                diff_toutputs_cond, predicted_noise, diff_toutputs_cond_half, diff_toutputs_cond_first = self.denoise_process(
+                    i, x, x_mid, x_low, len(self.test_loader), epoch=epoch
+                )
+                diff_toutputs = diff_toutputs_cond 
 
-                all_inputs.append(tinputs.detach().cpu())
+                all_inputs.append(ae_x.detach().cpu())
                 all_outputs.append(diff_toutputs.detach().cpu())
 
                 # ======== PCA, Mahalanobis distance ========
@@ -491,14 +388,6 @@ class Solver():
                 pred_eps = predicted_noise.reshape(B * T, D)
                 eps_flat = eps.reshape(B * T, D)   
                 residual = eps_flat - pred_eps
-                
-                # Epsilon PCA
-                pca1 = torch.matmul(pred_eps - self.mu_eps, self.pca_components[0])
-                pca2 = torch.matmul(pred_eps - self.mu_eps, self.pca_components[1])
-                
-                # Residual PCA (NEW)
-                pca1_res = torch.matmul(residual - self.mu_res, self.pca_components_res[0])
-                pca2_res = torch.matmul(residual - self.mu_res, self.pca_components_res[1])
 
                 # Epsilon Mahalanobis
                 diff_eps = pred_eps - self.mu_eps
@@ -518,12 +407,6 @@ class Solver():
                 maha_res = torch.sqrt(
                     torch.einsum('bi,ij,bj->b', diff_res, self.inv_cov_res, diff_res)
                 )
-
-                # Concatenate totals
-                total_pca1 = torch.cat([total_pca1, pca1.reshape(-1)])
-                total_pca2 = torch.cat([total_pca2, pca2.reshape(-1)])
-                total_pca1_res = torch.cat([total_pca1_res, pca1_res.reshape(-1)]) # NEW
-                total_pca2_res = torch.cat([total_pca2_res, pca2_res.reshape(-1)]) # NEW
                 
                 total_maha_eps = torch.cat([total_maha_eps, maha_eps.reshape(-1)])
                 total_maha_res = torch.cat([total_maha_res, maha_res.reshape(-1)])
@@ -544,21 +427,12 @@ class Solver():
                     [total_res_scores, res_scores.reshape(-1)] # NEW
                 )
 
-                if self.history:
-                    # CFG Divergence: Difference between Conditioned and Unconditioned
-                    cond_preds = torch.square((diff_toutputs_cond - diff_toutputs_uncond))
-                    preds = torch.square((diff_toutputs - tinputs))
-                    uncond_cur = torch.square((diff_toutputs_uncond - tinputs))
-                    half_cur = torch.square((diff_toutputs_cond_half - tinputs))
-                    first_cur = torch.square((diff_toutputs_cond_first - tinputs))
-                else:
-                    # Standard Reconstruction Error fallback
-                    preds = torch.square((diff_toutputs - tinputs))
+                preds = torch.square((diff_toutputs - ae_x))
+                half_cur = torch.square((diff_toutputs_cond_half - ae_x))
+                first_cur = torch.square((diff_toutputs_cond_first - ae_x))
                     
                 anomaly_scores = torch.mean(preds, dim=2)
-                cond_anomaly_scores = torch.mean(cond_preds, dim=2)
                 preds_scores = torch.sum(torch.abs(predicted_noise), dim=2)
-                uncond_cur_scores = torch.mean(uncond_cur, dim=2)
                 half_cur_scores = torch.mean(half_cur, dim=2)
                 first_cur_scores = torch.mean(first_cur, dim=2)
 
@@ -567,14 +441,6 @@ class Solver():
                     [total_scores, anomaly_scores.reshape(-1)]
                 )
                 
-                total_cond_scores = torch.cat(
-                    [total_cond_scores, cond_anomaly_scores.reshape(-1)]
-                )
-
-                total_uncond_cur_scores = torch.cat(
-                    [total_uncond_cur_scores, uncond_cur_scores.reshape(-1)]
-                )
-
                 total_half_cur_scores = torch.cat(
                     [total_half_cur_scores, half_cur_scores.reshape(-1)]
                 )
@@ -611,7 +477,7 @@ class Solver():
         best_threshold = None
         total_labels = total_labels.detach().cpu()
 
-        for anomaly_threshold in torch.arange(0., 0.15 ,0.002):
+        for anomaly_threshold in torch.arange(0., 0.15 ,0.01):
 
             thresh = torch.quantile(
                 total_scores, 1. - anomaly_threshold.to(self.device)
@@ -747,22 +613,6 @@ class Solver():
 
         f.close()
 
-        if self.history:
-            total_hist = history_anomalous_count + history_normal_count
-
-            h_ratio = (
-                history_normal_count / total_hist if total_hist > 0 else 0
-            )
-
-            print(
-                f"History Stats: Normal={history_normal_count}, "
-                f"Anomalous={history_anomalous_count}, Ratio={h_ratio:.2f}"
-            )
-
-            self.tb_writer.add_scalar(
-                "History/Normal_Ratio", h_ratio, epoch
-            )
-
         self.tb_writer.add_scalars(
             "Scores",
             {
@@ -776,243 +626,164 @@ class Solver():
 
         self.tb_writer.flush()
 
-        
+        preds = best_predictions.int().numpy()
+        best_threshold = best_threshold.numpy()
+        total_pred_scores = total_pred_scores.cpu().numpy() 
+        total_half_cur_scores = total_half_cur_scores.cpu().numpy()
+        total_first_cur_scores = total_first_cur_scores.cpu().numpy()
+        total_scores = total_scores.cpu().numpy()
+        total_maha_eps = total_maha_eps.cpu().numpy()
+        total_cos_eps = total_cos_eps.cpu().numpy()
+        total_maha_res = total_maha_res.cpu().numpy()
+        total_cos_res = total_cos_res.cpu().numpy()
+        total_res_scores = total_res_scores.cpu().numpy()
+        labels = best_labels_final.int().numpy()
+        limit = len(preds)
+        with open(f"logs/{epoch}.txt", "w") as f:
+            f.write(f"epoch: {epoch}\n")
+            f.write(f"threshold: {best_threshold}\n")
+            anomaly_counter = -1
+            for i in range(limit):
+                if i % 96 == 0:
+                    anomaly_counter += 1
+                if preds[i] == 1 and labels[i] == 0:
+                    f.write(
+                        f"False Positive | index: {i} | "
+                        f"total_cond_scores: {total_scores[i]} | "
+                        f"total_half_scores: {total_half_cur_scores[i]} | "
+                        f"total_first_scores: {total_first_cur_scores[i]} | "
+                        f"epsilon: {total_pred_scores[i]} | "
+                        f"residual: {total_res_scores[i]} | "
+                        f"maha_eps: {total_maha_eps[i]} | "
+                        f"maha_res: {total_maha_res[i]} | "
+                        f"cos_eps: {total_cos_eps[i]} | "
+                        f"cos_res: {total_cos_res[i]}\n"
+                    )
+                if preds[i] == 0 and labels[i] == 1:
+                    f.write(
+                        f"False Negative | index: {i} | "
+                        f"total_cond_scores: {total_scores[i]} | "
+                        f"total_half_scores: {total_half_cur_scores[i]} | "
+                        f"total_first_scores: {total_first_cur_scores[i]} | "
+                        f"epsilon: {total_pred_scores[i]} | "
+                        f"residual: {total_res_scores[i]} | "
+                        f"maha_eps: {total_maha_eps[i]} | "
+                        f"maha_res: {total_maha_res[i]} | "
+                        f"cos_eps: {total_cos_eps[i]} | "
+                        f"cos_res: {total_cos_res[i]}\n"
+                    )
+                if preds[i] == 1 and labels[i] == 1:
+                    f.write(
+                        f"True Positive | index: {i} | "
+                        f"total_cond_scores: {total_scores[i]} | "
+                        f"total_half_scores: {total_half_cur_scores[i]} | "
+                        f"total_first_scores: {total_first_cur_scores[i]} | "
+                        f"epsilon: {total_pred_scores[i]} | "
+                        f"residual: {total_res_scores[i]} | "
+                        f"maha_eps: {total_maha_eps[i]} | "
+                        f"maha_res: {total_maha_res[i]} | "
+                        f"cos_eps: {total_cos_eps[i]} | "
+                        f"cos_res: {total_cos_res[i]}\n"
+                    )
+                if preds[i] == 0 and labels[i] == 0:
+                    f.write(
+                        f"True Negative | index: {i} | "
+                        f"total_cond_scores: {total_scores[i]} | "
+                        f"total_half_scores: {total_half_cur_scores[i]} | "
+                        f"total_first_scores: {total_first_cur_scores[i]} | "
+                        f"epsilon: {total_pred_scores[i]} | "
+                        f"residual: {total_res_scores[i]} | "
+                        f"maha_eps: {total_maha_eps[i]} | "
+                        f"maha_res: {total_maha_res[i]} | "
+                        f"cos_eps: {total_cos_eps[i]} | "
+                        f"cos_res: {total_cos_res[i]}\n"
+                    )
+
+        #preds = best_raw_predictions.int().numpy()
+        #labels = best_raw_labels_final.int().numpy()
+        #limit = len(preds)
+        #with open(f"rawlogs/{epoch}.txt", "w") as f:
+        #    f.write(f"epoch: {epoch}\n")
+        #    f.write(f"threshold: {best_threshold}\n")
+        #    anomaly_counter = -1
+        #    for i in range(limit):
+        #        if i % 96 == 0:
+        #            anomaly_counter += 1
+        #        if preds[i] == 1 and labels[i] == 0:
+        #            f.write(
+        #                f"False Positive | index: {i} | "
+        #                f"total_cond_scores: {total_scores[i]} | "
+        #                f"total_half_scores: {total_half_cur_scores[i]} | "
+        #                f"total_first_scores: {total_first_cur_scores[i]} | "
+        #                f"epsilon: {total_pred_scores[i]} | "
+        #                f"residual: {total_res_scores[i]} | "
+        #                f"pca1_eps: {total_pca1[i]} | "
+        #                f"pca2_eps: {total_pca2[i]} | "
+        #                f"pca1_res: {total_pca1_res[i]} | "
+        #                f"pca2_res: {total_pca2_res[i]} | "
+        #                f"maha_eps: {total_maha_eps[i]} | "
+        #                f"maha_res: {total_maha_res[i]} | "
+        #                f"cos_eps: {total_cos_eps[i]} | "
+        #                f"cos_res: {total_cos_res[i]}\n"
+        #            )
+        #        if preds[i] == 0 and labels[i] == 1:
+        #            f.write(
+        #                f"False Negative | index: {i} | "
+        #                f"total_cond_scores: {total_scores[i]} | "
+        #                f"total_half_scores: {total_half_cur_scores[i]} | "
+        #                f"total_first_scores: {total_first_cur_scores[i]} | "
+        #                f"epsilon: {total_pred_scores[i]} | "
+        #                f"residual: {total_res_scores[i]} | "
+        #                f"pca1_eps: {total_pca1[i]} | "
+        #                f"pca2_eps: {total_pca2[i]} | "
+        #                f"pca1_res: {total_pca1_res[i]} | "
+        #                f"pca2_res: {total_pca2_res[i]} | "
+        #                f"maha_eps: {total_maha_eps[i]} | "
+        #                f"maha_res: {total_maha_res[i]} | "
+        #                f"cos_eps: {total_cos_eps[i]} | "
+        #                f"cos_res: {total_cos_res[i]}\n"
+        #            )
+        #        if preds[i] == 1 and labels[i] == 1:
+        #            f.write(
+        #                f"True Positive | index: {i} | "
+        #                f"total_cond_scores: {total_scores[i]} | "
+        #                f"total_half_scores: {total_half_cur_scores[i]} | "
+        #                f"total_first_scores: {total_first_cur_scores[i]} | "
+        #                f"epsilon: {total_pred_scores[i]} | "
+        #                f"residual: {total_res_scores[i]} | "
+        #                f"pca1_eps: {total_pca1[i]} | "
+        #                f"pca2_eps: {total_pca2[i]} | "
+        #                f"pca1_res: {total_pca1_res[i]} | "
+        #                f"pca2_res: {total_pca2_res[i]} | "
+        #                f"maha_eps: {total_maha_eps[i]} | "
+        #                f"maha_res: {total_maha_res[i]} | "
+        #                f"cos_eps: {total_cos_eps[i]} | "
+        #                f"cos_res: {total_cos_res[i]}\n"
+        #            )
+        #        if preds[i] == 0 and labels[i] == 0:
+        #            f.write(
+        #                f"True Negative | index: {i} | "
+        #                f"total_cond_scores: {total_scores[i]} | "
+        #                f"total_half_scores: {total_half_cur_scores[i]} | "
+        #                f"total_first_scores: {total_first_cur_scores[i]} | "
+        #                f"epsilon: {total_pred_scores[i]} | "
+        #                f"residual: {total_res_scores[i]} | "
+        #                f"pca1_eps: {total_pca1[i]} | "
+        #                f"pca2_eps: {total_pca2[i]} | "
+        #                f"pca1_res: {total_pca1_res[i]} | "
+        #                f"pca2_res: {total_pca2_res[i]} | "
+        #                f"maha_eps: {total_maha_eps[i]} | "
+        #                f"maha_res: {total_maha_res[i]} | "
+        #                f"cos_eps: {total_cos_eps[i]} | "
+        #                f"cos_res: {total_cos_res[i]}\n"
+        #            )
 
 
-        all_inputs = torch.cat(all_inputs)
-        all_outputs = torch.cat(all_outputs)
-
-        #preds = total_predictions.int()
-        #labels = total_labels.int().numpy()
-        #print("preds: ", preds.shape)
-        #print("history flag: ", history_flags.shape)
-
-        if self.history:
-            history_flags = torch.cat(history_flags)
-            preds = best_predictions.int().numpy()
-            best_threshold = best_threshold.numpy()
-            total_pred_scores = total_pred_scores.cpu().numpy() 
-            total_cond_scores = total_cond_scores.cpu().numpy()
-            total_uncond_cur_scores = total_uncond_cur_scores.cpu().numpy()
-            total_half_cur_scores = total_half_cur_scores.cpu().numpy()
-            total_first_cur_scores = total_first_cur_scores.cpu().numpy()
-            total_scores = total_scores.cpu().numpy()
-            total_pca1 = total_pca1.cpu().numpy()
-            total_pca2 = total_pca2.cpu().numpy()
-            total_maha_eps = total_maha_eps.cpu().numpy()
-            total_cos_eps = total_cos_eps.cpu().numpy()
-            total_maha_res = total_maha_res.cpu().numpy()
-            total_pca1_res = total_pca1_res.cpu().numpy()
-            total_pca2_res = total_pca2_res.cpu().numpy()
-            total_cos_res = total_cos_res.cpu().numpy()
-            total_res_scores = total_res_scores.cpu().numpy()
-            labels = best_labels_final.int().numpy()
-            history_flags = history_flags.numpy()
-            limit = len(preds)
-            with open(f"logs/{epoch}.txt", "w") as f:
-
-                f.write(f"epoch: {epoch}\n")
-                f.write(f"threshold: {best_threshold}\n")
-
-                anomaly_counter = -1
-                for i in range(limit):
-                    if i % 96 == 0:
-                        anomaly_counter += 1
-
-                    if preds[i] == 1 and labels[i] == 0:
-                        f.write(
-                            f"False Positive | index: {i} | "
-                            f"history_anomalous: {history_anomalous_counts[anomaly_counter]} | "
-                            f"total_cond_scores: {total_scores[i]} | "
-                            f"total_uncond_scores: {total_uncond_cur_scores[i]} | "
-                            f"total_cond_uncond_scores: {total_cond_scores[i]} | "
-                            f"total_half_scores: {total_half_cur_scores[i]} | "
-                            f"total_first_scores: {total_first_cur_scores[i]} | "
-                            f"epsilon: {total_pred_scores[i]} | "
-                            f"residual: {total_res_scores[i]} | "
-                            f"pca1_eps: {total_pca1[i]} | "
-                            f"pca2_eps: {total_pca2[i]} | "
-                            f"pca1_res: {total_pca1_res[i]} | "
-                            f"pca2_res: {total_pca2_res[i]} | "
-                            f"maha_eps: {total_maha_eps[i]} | "
-                            f"maha_res: {total_maha_res[i]} | "
-                            f"cos_eps: {total_cos_eps[i]} | "
-                            f"cos_res: {total_cos_res[i]}\n"
-                        )
-
-                    if preds[i] == 0 and labels[i] == 1:
-                        f.write(
-                            f"False Negative | index: {i} | "
-                            f"history_anomalous: {history_anomalous_counts[anomaly_counter]} | "
-                            f"total_cond_scores: {total_scores[i]} | "
-                            f"total_uncond_scores: {total_uncond_cur_scores[i]} | "
-                            f"total_cond_uncond_scores: {total_cond_scores[i]} | "
-                            f"total_half_scores: {total_half_cur_scores[i]} | "
-                            f"total_first_scores: {total_first_cur_scores[i]} | "
-                            f"epsilon: {total_pred_scores[i]} | "
-                            f"residual: {total_res_scores[i]} | "
-                            f"pca1_eps: {total_pca1[i]} | "
-                            f"pca2_eps: {total_pca2[i]} | "
-                            f"pca1_res: {total_pca1_res[i]} | "
-                            f"pca2_res: {total_pca2_res[i]} | "
-                            f"maha_eps: {total_maha_eps[i]} | "
-                            f"maha_res: {total_maha_res[i]} | "
-                            f"cos_eps: {total_cos_eps[i]} | "
-                            f"cos_res: {total_cos_res[i]}\n"
-                        )
-
-                    if preds[i] == 1 and labels[i] == 1:
-                        f.write(
-                            f"True Positive | index: {i} | "
-                            f"history_anomalous: {history_anomalous_counts[anomaly_counter]} | "
-                            f"total_cond_scores: {total_scores[i]} | "
-                            f"total_uncond_scores: {total_uncond_cur_scores[i]} | "
-                            f"total_cond_uncond_scores: {total_cond_scores[i]} | "
-                            f"total_half_scores: {total_half_cur_scores[i]} | "
-                            f"total_first_scores: {total_first_cur_scores[i]} | "
-                            f"epsilon: {total_pred_scores[i]} | "
-                            f"residual: {total_res_scores[i]} | "
-                            f"pca1_eps: {total_pca1[i]} | "
-                            f"pca2_eps: {total_pca2[i]} | "
-                            f"pca1_res: {total_pca1_res[i]} | "
-                            f"pca2_res: {total_pca2_res[i]} | "
-                            f"maha_eps: {total_maha_eps[i]} | "
-                            f"maha_res: {total_maha_res[i]} | "
-                            f"cos_eps: {total_cos_eps[i]} | "
-                            f"cos_res: {total_cos_res[i]}\n"
-                        )
-
-                    if preds[i] == 0 and labels[i] == 0:
-                        f.write(
-                            f"True Negative | index: {i} | "
-                            f"history_anomalous: {history_anomalous_counts[anomaly_counter]} | "
-                            f"total_cond_scores: {total_scores[i]} | "
-                            f"total_uncond_scores: {total_uncond_cur_scores[i]} | "
-                            f"total_cond_uncond_scores: {total_cond_scores[i]} | "
-                            f"total_half_scores: {total_half_cur_scores[i]} | "
-                            f"total_first_scores: {total_first_cur_scores[i]} | "
-                            f"epsilon: {total_pred_scores[i]} | "
-                            f"residual: {total_res_scores[i]} | "
-                            f"pca1_eps: {total_pca1[i]} | "
-                            f"pca2_eps: {total_pca2[i]} | "
-                            f"pca1_res: {total_pca1_res[i]} | "
-                            f"pca2_res: {total_pca2_res[i]} | "
-                            f"maha_eps: {total_maha_eps[i]} | "
-                            f"maha_res: {total_maha_res[i]} | "
-                            f"cos_eps: {total_cos_eps[i]} | "
-                            f"cos_res: {total_cos_res[i]}\n"
-                        )
-
-        if self.history:
-            preds = best_raw_predictions.int().numpy()
-            labels = best_raw_labels_final.int().numpy()
-            limit = len(preds)
-            with open(f"rawlogs/{epoch}.txt", "w") as f:
-
-                f.write(f"epoch: {epoch}\n")
-                f.write(f"threshold: {best_threshold}\n")
-
-                anomaly_counter = -1
-                for i in range(limit):
-                    if i % 96 == 0:
-                        anomaly_counter += 1
-
-                    if preds[i] == 1 and labels[i] == 0:
-                        f.write(
-                            f"False Positive | index: {i} | "
-                            f"history_anomalous: {history_anomalous_counts[anomaly_counter]} | "
-                            f"total_cond_scores: {total_scores[i]} | "
-                            f"total_uncond_scores: {total_uncond_cur_scores[i]} | "
-                            f"total_cond_uncond_scores: {total_cond_scores[i]} | "
-                            f"total_half_scores: {total_half_cur_scores[i]} | "
-                            f"total_first_scores: {total_first_cur_scores[i]} | "
-                            f"epsilon: {total_pred_scores[i]} | "
-                            f"residual: {total_res_scores[i]} | "
-                            f"pca1_eps: {total_pca1[i]} | "
-                            f"pca2_eps: {total_pca2[i]} | "
-                            f"pca1_res: {total_pca1_res[i]} | "
-                            f"pca2_res: {total_pca2_res[i]} | "
-                            f"maha_eps: {total_maha_eps[i]} | "
-                            f"maha_res: {total_maha_res[i]} | "
-                            f"cos_eps: {total_cos_eps[i]} | "
-                            f"cos_res: {total_cos_res[i]}\n"
-                        )
-
-                    if preds[i] == 0 and labels[i] == 1:
-                        f.write(
-                            f"False Negative | index: {i} | "
-                            f"history_anomalous: {history_anomalous_counts[anomaly_counter]} | "
-                            f"total_cond_scores: {total_scores[i]} | "
-                            f"total_uncond_scores: {total_uncond_cur_scores[i]} | "
-                            f"total_cond_uncond_scores: {total_cond_scores[i]} | "
-                            f"total_half_scores: {total_half_cur_scores[i]} | "
-                            f"total_first_scores: {total_first_cur_scores[i]} | "
-                            f"epsilon: {total_pred_scores[i]} | "
-                            f"residual: {total_res_scores[i]} | "
-                            f"pca1_eps: {total_pca1[i]} | "
-                            f"pca2_eps: {total_pca2[i]} | "
-                            f"pca1_res: {total_pca1_res[i]} | "
-                            f"pca2_res: {total_pca2_res[i]} | "
-                            f"maha_eps: {total_maha_eps[i]} | "
-                            f"maha_res: {total_maha_res[i]} | "
-                            f"cos_eps: {total_cos_eps[i]} | "
-                            f"cos_res: {total_cos_res[i]}\n"
-                        )
-
-                    if preds[i] == 1 and labels[i] == 1:
-                        f.write(
-                            f"True Positive | index: {i} | "
-                            f"history_anomalous: {history_anomalous_counts[anomaly_counter]} | "
-                            f"total_cond_scores: {total_scores[i]} | "
-                            f"total_uncond_scores: {total_uncond_cur_scores[i]} | "
-                            f"total_cond_uncond_scores: {total_cond_scores[i]} | "
-                            f"total_half_scores: {total_half_cur_scores[i]} | "
-                            f"total_first_scores: {total_first_cur_scores[i]} | "
-                            f"epsilon: {total_pred_scores[i]} | "
-                            f"residual: {total_res_scores[i]} | "
-                            f"pca1_eps: {total_pca1[i]} | "
-                            f"pca2_eps: {total_pca2[i]} | "
-                            f"pca1_res: {total_pca1_res[i]} | "
-                            f"pca2_res: {total_pca2_res[i]} | "
-                            f"maha_eps: {total_maha_eps[i]} | "
-                            f"maha_res: {total_maha_res[i]} | "
-                            f"cos_eps: {total_cos_eps[i]} | "
-                            f"cos_res: {total_cos_res[i]}\n"
-                        )
-
-                    if preds[i] == 0 and labels[i] == 0:
-                        f.write(
-                            f"True Negative | index: {i} | "
-                            f"history_anomalous: {history_anomalous_counts[anomaly_counter]} | "
-                            f"total_cond_scores: {total_scores[i]} | "
-                            f"total_uncond_scores: {total_uncond_cur_scores[i]} | "
-                            f"total_cond_uncond_scores: {total_cond_scores[i]} | "
-                            f"total_half_scores: {total_half_cur_scores[i]} | "
-                            f"total_first_scores: {total_first_cur_scores[i]} | "
-                            f"epsilon: {total_pred_scores[i]} | "
-                            f"residual: {total_res_scores[i]} | "
-                            f"pca1_eps: {total_pca1[i]} | "
-                            f"pca2_eps: {total_pca2[i]} | "
-                            f"pca1_res: {total_pca1_res[i]} | "
-                            f"pca2_res: {total_pca2_res[i]} | "
-                            f"maha_eps: {total_maha_eps[i]} | "
-                            f"maha_res: {total_maha_res[i]} | "
-                            f"cos_eps: {total_cos_eps[i]} | "
-                            f"cos_res: {total_cos_res[i]}\n"
-                        )
-
-
-
-
-
-    def save_model(self, names : list[str] = ['History', 'Diffusion']):
-        names = [f"{name}_{self.model_name}" for name in names]
+    def save_model(self, names : 'Diffusion'):
         folder = "trained_models"
         #torch.save(self.autoencoder.state_dict(), f"{folder}/{names[0]}.pth")
-        print(f"Saved PyTorch Model State to {names[0]}.pth")
-        torch.save(self.diff_model.state_dict(), f"{folder}/{names[1]}.pth")
-        torch.save(self.history_model.state_dict(), f"{folder}/{names[0]}.pth")
-        print(f"Saved PyTorch Model State to {names[1]}.pth")
+        print(f"Saved PyTorch Model State to {names}.pth")
+        torch.save(self.diff_model.state_dict(), f"{folder}/{names}.pth")
 
     def load_model(self, names: list[str] = [f'AE', f'Diffusion']):
         names = [f"{name}_{self.model_name}" for name in names]
