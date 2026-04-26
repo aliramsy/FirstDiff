@@ -3,14 +3,16 @@ import torch
 from sklearn.decomposition import PCA
 from sklearn.covariance import LedoitWolf
 from torch.utils.tensorboard import SummaryWriter
-from torcheval.metrics.functional import binary_f1_score, binary_precision, binary_recall, binary_auroc
+from torcheval.metrics.functional import binary_f1_score, binary_precision, binary_recall
 from model.Diffusion import *
+from sklearn.metrics import roc_auc_score
 
 class Solver():
     # add autoencoder to the init function it is after self
-    def __init__(self, diff_model, train_loader, val_loader, test_loader, diffusion=None, mask_data=True, anomaly_ratio=0.05, experiment=None, device='cuda', gpu_id=0, decomposer = None):
+    def __init__(self, diff_model, train_loader, val_loader, test_loader, diffusion=None, mask_data=True, anomaly_ratio=0.05, experiment=None, device='cuda', gpu_id=0, decomposer = None, dataset = None):
         #self.autoencoder = autoencoder
         self.decomposer = decomposer
+        self.dataset = dataset
         self.mask_data = mask_data
         self.diff_model = diff_model
         self.train_loader = train_loader
@@ -116,13 +118,14 @@ class Solver():
             avg_vloss = self.val(epoch)
             self.tb_writer.add_scalars('Loss', {"Train" : avg_loss, "Val" : avg_vloss}, epoch)
             print(f"EPOCH {epoch} LOSS train {avg_loss} valid {avg_vloss}")
-            self.test(epoch)
+            if epoch == epochs - 1:
+                self.test(epoch)
 
             #if epoch % 5 == 0 and epoch !=0:
             #    self.save_model([f'AE_{epoch}', f'Diffusion_{epoch}'])
 
         self.tb_writer.flush()
-        self.save_model(f'Diffusion_{epoch}')
+        #self.save_model(f'Diffusion_{epoch}')
 
     
     def denoise_process(self, i, x, batch_num=128, epoch=None):
@@ -132,7 +135,7 @@ class Solver():
             self.diff_model.eval()
 
             predicted_noise = self.diff_model(x_curr=x, t=t)
-            if j == self.diffusion.noise_steps - 1:
+            if j == self.diffusion.noise_steps - 10:
                 ret_predicted_noise_cond = predicted_noise.clone()
 
             if j % 100 == 0:
@@ -157,6 +160,7 @@ class Solver():
                 #ret_first_noise = x_low + x_mid + ret_first_noise
         #x = x + x_low + x_mid
 
+        self.diff_model.train()
         return x, ret_predicted_noise_cond, ret_half_noise, ret_first_noise
 
     
@@ -249,6 +253,8 @@ class Solver():
         return avg_vloss
     
     def adjust_preds(self, preds, labels):
+        anomaly_flag = False
+        preds = preds.copy()
         for i in range(len(labels)):
                 if labels[i] == 1 and preds[i] == 1 and not anomaly_flag:
                     anomaly_flag = True
@@ -272,54 +278,50 @@ class Solver():
     
     def calculate_add(self, raw_predict, actual):
         """
-        Calculates the Anomaly Detection Delay (ADD) quickly using vectorization.
+        Calculates the Anomaly Detection Delay (ADD).
         """
-        # Ensure they are on CPU to avoid sync overhead if not already
-        if actual.is_cuda:
-            actual = actual.cpu()
-        if raw_predict.is_cuda:
-            raw_predict = raw_predict.cpu()
-
-        # Find where actual transitions from 0 to 1 (starts) and 1 to 0 (ends)
-        diff = torch.diff(actual, prepend=torch.tensor([0.0]))
+        # If they are already numpy arrays, skip the .is_cuda check
+        if isinstance(raw_predict, torch.Tensor):
+            if raw_predict.is_cuda:
+                raw_predict = raw_predict.cpu()
+            raw_predict = raw_predict.numpy()
+            
+        if isinstance(actual, torch.Tensor):
+            if actual.is_cuda:
+                actual = actual.cpu()
+            actual = actual.numpy()
+    
+        # Now use numpy logic for the diff
+        import numpy as np
+        diff = np.diff(actual, prepend=0.0)
         
-        starts = torch.where(diff == 1)[0]
-        ends = torch.where(diff == -1)[0]
+        starts = np.where(diff == 1)[0]
+        ends = np.where(diff == -1)[0]
         
-        # Handle edge case: if the sequence ends while still in an anomaly
         if len(ends) < len(starts):
-            ends = torch.cat([ends, torch.tensor([len(actual)])])
+            ends = np.append(ends, len(actual))
             
         if len(starts) == 0:
             return 0.0
-
+    
         delays = []
-        
-        # Iterate over the segments (fast, because there are usually few segments)
         for s, e in zip(starts, ends):
             segment_preds = raw_predict[s:e]
-            
-            # argmax is extremely fast and returns the index of the first '1' 
-            # (or 0 if no 1s exist, so we double-check if it actually hit)
-            first_hit_idx = torch.argmax(segment_preds).item()
+            first_hit_idx = np.argmax(segment_preds)
             
             if segment_preds[first_hit_idx] == 1:
                 delays.append(first_hit_idx)
                 
-        if len(delays) == 0:
+        return sum(delays) / len(delays) if len(delays) > 0 else 0.0
+    
+    def compute_range_auc_roc(self, labels, scores):
+        try:
+            return roc_auc_score(labels.cpu().numpy(), scores.cpu().numpy())
+        except:
             return 0.0
-            
-        return sum(delays) / len(delays)
 
     
 
-    def get_best_score(self, f1, p, r, rocauc, threshold, scores: dict, key='f1'):
-        if f1 > scores[key]:
-            scores[key] = f1
-            scores['p'] = p
-            scores['r'] = r
-            scores['rocauc'] = rocauc
-            scores['thres'] = threshold
     
     def test(self, epoch):
 
@@ -449,9 +451,6 @@ class Solver():
                     [total_first_cur_scores, first_cur_scores.reshape(-1)]
                 )
 
-                total_pred_scores = torch.cat(
-                    [total_pred_scores, preds_scores.reshape(-1)]
-                )
 
                 total_labels = torch.cat(
                     [total_labels, labels.reshape(-1)]
@@ -464,182 +463,303 @@ class Solver():
 
                 running_tloss += tloss.item()
 
-        avg_tloss = running_tloss / len(self.test_loader)
-
-        best_scores = {"f1": 0, "p": 0, "r": 0, "rocauc": 0}
-        best_raw_scores = {"f1": 0, "p": 0, "r": 0, "rocauc": 0}
-
-        f = open("results.txt", "w")
-        f.write(f"epoch: {epoch} \n")
-
-        best_predictions = None
-        best_labels_final = None
-        best_threshold = None
-        total_labels = total_labels.detach().cpu()
-
-        for anomaly_threshold in torch.arange(0., 0.15 ,0.01):
-
-            thresh = torch.quantile(
-                total_scores, 1. - anomaly_threshold.to(self.device)
-            )
-
-            raw_predictions = torch.where(
-                total_scores >= thresh, 1., 0.
-            )
-            raw_predictions = raw_predictions.detach().cpu()
-
-            raw_tp = torch.sum(
-                (raw_predictions == 1) & (total_labels == 1)
-            ).item()
-
-            raw_fp = torch.sum(
-                (raw_predictions == 1) & (total_labels == 0)
-            ).item()
-
-            raw_tn = torch.sum(
-                (raw_predictions == 0) & (total_labels == 0)
-            ).item()
-
-            raw_fn = torch.sum(
-                (raw_predictions == 0) & (total_labels == 1)
-            ).item()
-
-            raw_f1 = binary_f1_score(
-                raw_predictions, total_labels, threshold=anomaly_threshold
-            )
-            if raw_f1 > best_raw_scores["f1"]:
-                best_raw_predictions = raw_predictions.clone()
-                best_raw_labels_final = total_labels.clone()
-                best_threshold_raw = anomaly_threshold
-
-            raw_p = binary_precision(
-                raw_predictions,
-                total_labels.type(torch.int32),
-                threshold=anomaly_threshold,
-            )
-
-            raw_r = binary_recall(
-                raw_predictions,
-                total_labels.type(torch.int32),
-                threshold=anomaly_threshold,
-            )
-
-            raw_roc = binary_auroc(raw_predictions, total_labels)
-
-            # --- NEW ADD CALCULATION HERE ---
-            avg_delay = self.calculate_add(raw_predictions, total_labels)
-
-            adj_predictions = self.adjust_preds(
-                raw_predictions.detach().cpu().numpy(),
-                total_labels.numpy(),
-            )
-
-            adj_tp = torch.sum(
-                (adj_predictions == 1) & (total_labels == 1)
-            ).item()
-
-            adj_fp = torch.sum(
-                (adj_predictions == 1) & (total_labels == 0)
-            ).item()
-
-            adj_tn = torch.sum(
-                (adj_predictions == 0) & (total_labels == 0)
-            ).item()
-
-            adj_fn = torch.sum(
-                (adj_predictions == 0) & (total_labels == 1)
-            ).item()
-
-            adj_f1 = binary_f1_score(
-                adj_predictions, total_labels, threshold=anomaly_threshold
-            )
-            # select best
-            if adj_f1 > best_scores["f1"]:
-                best_predictions = adj_predictions.clone()
-                best_labels_final = total_labels.clone()
-                best_threshold = anomaly_threshold
+        # =========================
+        # THRESHOLD GRID (FIXED)
+        # =========================
+        threshold_grid = torch.linspace(0.0, 0.300, 300, device=self.device)
 
 
-            adj_p = binary_precision(
-                adj_predictions,
-                total_labels.type(torch.int32),
-                threshold=anomaly_threshold,
-            )
+        def evaluate_score(score_tensor, labels, adjusted=True):
+        
+            score_tensor = score_tensor.to(self.device)
+            labels = labels.to(self.device)
 
-            adj_r = binary_recall(
-                adj_predictions,
-                total_labels.type(torch.int32),
-                threshold=anomaly_threshold,
-            )
+            # ---- FIX: R-AUC computed ONCE (not per threshold) ----
+            rauc = self.compute_range_auc_roc(labels, score_tensor)
 
-            adj_roc = binary_auroc(adj_predictions, total_labels)
+            best = {
+                "f1": 0.0,
+                "p": 0.0,
+                "r": 0.0,
+                "add": 0.0,
+                "rauc": rauc,
+                "thresh_ratio": 0.0,
+                "thresh_value": 0.0
+            }
 
-            self.get_best_score(
-                adj_f1,
-                adj_p,
-                adj_r,
-                adj_roc,
-                anomaly_threshold,
-                best_scores,
-            )
+            all_results = []
 
-            msg_raw = (
-                f"[RAW] Thresh {anomaly_threshold:.3f}, "
-                f"f1: {raw_f1:.4f}, p: {raw_p:.4f}, r: {raw_r:.4f}, "
-                f"ROC: {raw_roc:.4f} | ADD: {avg_delay:.2f} | "
-                f"TP:{raw_tp} FP:{raw_fp} TN:{raw_tn} FN:{raw_fn}"
-            )
+            for ratio in threshold_grid:
+            
+                thresh_value = torch.quantile(score_tensor, 1. - ratio)
 
-            print(msg_raw)
-            #f.write(msg_raw + "\n")
+                preds = (score_tensor >= thresh_value).float()
+                lbls = labels
 
-            msg_adj = (
-                f"[ADJ] Thresh {anomaly_threshold:.3f}, "
-                f"f1: {adj_f1:.4f}, p: {adj_p:.4f}, r: {adj_r:.4f}, "
-                f"ROC: {adj_roc:.4f} | ADD: {avg_delay:.2f} | "
-                f"TP:{adj_tp} FP:{adj_fp} TN:{adj_tn} FN:{adj_fn}"
-            )
+                # =========================
+                # ADJUSTMENT FIX
+                # =========================
+                if adjusted:
+                    preds_np = preds.detach().cpu().numpy()
+                    lbls_np = lbls.detach().cpu().numpy()
+
+                    preds_adj = self.adjust_preds(preds_np, lbls_np)
+                    # Faster and removes the warning
+                    preds_final = preds_adj.to(self.device).detach()
+                else:
+                    preds_final = preds
+
+                # =========================
+                # METRICS
+                # =========================
+                f1 = binary_f1_score(preds_final, lbls.int())
+                p = binary_precision(preds_final, lbls.int())
+                r = binary_recall(preds_final, lbls.int())
+
+                # ADD must use RAW preds
+                add = self.calculate_add(preds.detach().cpu().numpy(), lbls.detach().cpu().numpy())
+
+                all_results.append((ratio.item(), thresh_value.item(), float(f1)))
+
+                if f1 > best["f1"]:
+                    best = {
+                        "f1": float(f1),
+                        "p": float(p),
+                        "r": float(r),
+                        "add": float(add),
+                        "rauc": float(rauc),
+                        "thresh_ratio": float(ratio.item()),
+                        "thresh_value": float(thresh_value.item())
+                    }
+
+            return best, all_results
 
 
-            print(msg_adj)
-            #f.write(msg_adj + "\n")
-            #f.write("-" * 50 + "\n")
+        # =========================
+        # SCORE DICTIONARY
+        # =========================
+        score_dict = {
+            "total": total_scores,
+            "maha_eps": total_maha_eps,
+            "maha_res": total_maha_res,
+            "epsilon": total_pred_scores,
+            "residual": total_res_scores,
+            "cos_eps": total_cos_eps,
+            "cos_res": total_cos_res,
+        }
+
+        results = {}
+
+        for name, score_tensor in score_dict.items():
+            best_adj, all_adj = evaluate_score(score_tensor, total_labels, adjusted=True)
+            best_raw, all_raw = evaluate_score(score_tensor, total_labels, adjusted=False)
+
+            results[name] = {
+                "adj": best_adj,
+                "raw": best_raw,
+                "all_adj": all_adj,
+                "all_raw": all_raw
+            }
+
+
+        # =========================
+        # NEIGHBOR FUNCTION (FIXED SAFE INDEXING)
+        # =========================
+        def get_neighbors(all_results, best_ratio):
+            # Extract all ratios from the 250-point results
+            ratios = [r for r, _, _ in all_results]
+        
+            if best_ratio not in ratios:
+                idx = min(range(len(ratios)), key=lambda i: abs(ratios[i] - best_ratio))
+            else:
+                idx = ratios.index(best_ratio)
+        
+            # To get 41 neighbors (20 left, the best one, 20 right):
+            lower_bound = max(0, idx - 20)
+            upper_bound = min(len(ratios), idx + 21)
+            
+            # Slice the ratios list to get the neighbors
+            neighbor_ratios = ratios[lower_bound:upper_bound]
+        
+            return neighbor_ratios
+
+        # =========================
+        # COMBINATION SEARCH
+        # =========================
+        def combination_search(base_name, other_name, adjusted=True):
+            base_results = results[base_name]["all_adj" if adjusted else "all_raw"]
+            other_results = results[other_name]["all_adj" if adjusted else "all_raw"]
+
+            base_best = results[base_name]["adj" if adjusted else "raw"]["thresh_ratio"]
+            other_best = results[other_name]["adj" if adjusted else "raw"]["thresh_ratio"]
+
+            base_neighbors = get_neighbors(base_results, base_best)
+            other_neighbors = get_neighbors(other_results, other_best)
+
+            # ========================================================
+            # NEW: CONTINUOUS ROC CALCULATION (BEFORE LOOP)
+            # ========================================================
+            s1 = score_dict[base_name]
+            s2 = score_dict[other_name]
+
+            # Min-Max Normalization to bring both to the same scale [0, 1]
+            s1_norm = (s1 - s1.min()) / (s1.max() - s1.min() + 1e-12)
+            s2_norm = (s2 - s2.min()) / (s2.max() - s2.min() + 1e-12)
+
+            # Create combined continuous scores
+            combined_continuous_scores = s1_norm + s2_norm
+
+            # Calculate one consistent ROC for the combined signal
+            continuous_rauc = self.compute_range_auc_roc(total_labels, combined_continuous_scores)
+            # ========================================================
+
+            # Initialize best_combo with the continuous ROC
+            best_combo = {"f1": 0.0, "p": 0.0, "r": 0.0, "add": 0.0, "rauc": float(continuous_rauc)}
+
+            lbls = total_labels.to(self.device)
+
+            for r1 in base_neighbors:
+                thresh1 = torch.quantile(s1, 1. - r1)
+                preds1 = s1 >= thresh1
+
+                for r2 in other_neighbors:
+                    thresh2 = torch.quantile(s2, 1. - r2)
+                    preds2 = s2 >= thresh2
+
+                    # OR fusion (exactly the same as v >= 1)
+                    preds_raw = (preds1 | preds2).float()
+
+                    if adjusted:
+                        preds_np = preds_raw.detach().cpu().numpy()
+                        lbls_np = lbls.detach().cpu().numpy()
+                        preds_adj = self.adjust_preds(preds_np, lbls_np)
+                        preds_final = preds_adj.to(self.device)
+                    else:
+                        preds_final = preds_raw
+
+                    # Calculate F1 to find the best threshold pair
+                    f1 = binary_f1_score(preds_final, lbls.int())
+
+                    if f1 > best_combo["f1"]:
+                        p = binary_precision(preds_final, lbls.int())
+                        r = binary_recall(preds_final, lbls.int())
+                        # ADD uses RAW predictions (no adjustment)
+                        add = self.calculate_add(preds_raw.detach().cpu().numpy(), lbls.detach().cpu().numpy())
+
+                        best_combo = {
+                            "f1": float(f1),
+                            "p": float(p),
+                            "r": float(r),
+                            "add": float(add),
+                            "rauc": float(continuous_rauc), # Still uses the continuous value
+                            "ratio1": r1,
+                            "ratio2": r2
+                        }
+
+            return best_combo
+
+
+        # =========================
+        # COMBINATIONS
+        # =========================
+        combo_results = {}
+
+        pairs = ["epsilon", "residual", "cos_res", "cos_eps", "maha_res"]
+
+        for name in pairs:
+            combo_results[f"total+{name}_adj"] = combination_search("total", name, adjusted=True)
+            combo_results[f"total+{name}_raw"] = combination_search("total", name, adjusted=False)
+
+        if epoch == 14:
             with open("log.txt", "a") as f:
-                f.write(msg_raw + "\n")
-                f.write(msg_adj + "\n")
-                f.write("-" * 50 + "\n")
+            
+                f.write(f"\n===== Epoch {epoch} BEST RESULTS =====\n")
+                f.write(f"\n===== dataset {self.dataset} BEST RESULTS =====\n")
+        
+                # =========================
+                # SINGLE DETECTOR RESULTS
+                # =========================
+                for name in results:
+                
+                    adj = results[name]["adj"]
+                    raw = results[name]["raw"]
+        
+                    # ---------- ADJUSTED ----------
+                    f.write(f"\n[{name.upper()} - ADJ]\n")
+                    f.write(f"Best Threshold Ratio: {adj['thresh_ratio']}\n")
+                    f.write(f"Precision: {adj['p']}\n")
+                    f.write(f"Recall: {adj['r']}\n")
+                    f.write(f"F1: {adj['f1']}\n")
+                    f.write(f"ADD: {adj['add']}\n")
+                    f.write(f"R-AUC-ROC: {adj['rauc']}\n")
+        
+                    # ---------- RAW ----------
+                    f.write(f"\n[{name.upper()} - RAW]\n")
+                    f.write(f"Best Threshold Ratio: {raw['thresh_ratio']}\n")
+                    f.write(f"Precision: {raw['p']}\n")
+                    f.write(f"Recall: {raw['r']}\n")
+                    f.write(f"F1: {raw['f1']}\n")
+                    f.write(f"ADD: {raw['add']}\n")
+                    f.write(f"R-AUC-ROC: {raw['rauc']}\n")
+        
+        
+                # =========================
+                # COMBINATION RESULTS
+                # =========================
+                f.write("\n--- COMBINATIONS (Best by F1) ---\n")
 
-            total_predictions = adj_predictions
+                for k, v in combo_results.items():
+                    f.write(f"\n{k}:\n")
+                    f.write(f"  F1: {v['f1']:.4f}\n")
+                    f.write(f"  Precision: {v['p']:.4f}\n")
+                    f.write(f"  Recall: {v['r']:.4f}\n")
+                    f.write(f"  ADD: {v['add']:.2f}\n")
+                    f.write(f"  R-AUC-ROC: {v['rauc']:.4f}\n")
+                    f.write(f"  Ratio1: {v['ratio1']}\n")
+                    f.write(f"  Ratio2: {v['ratio2']}\n")
 
-        f.close()
+
+        # =========================
+        # FIX: TENSORBOARD & FILE LOGGING
+        # =========================
+        # We will use the 'total' score's best adjusted results as the main anchor for plotting and logs.
+        best_total_adj = results["total"]["adj"]
 
         self.tb_writer.add_scalars(
-            "Scores",
+            "Scores_Total_Adj",
             {
-                "P": best_scores["p"],
-                "R": best_scores["r"],
-                "F1": best_scores["f1"],
-                "ROCAUC": best_scores["rocauc"],
-                "Threshold": best_scores["thres"],
+                "P": best_total_adj["p"],
+                "R": best_total_adj["r"],
+                "F1": best_total_adj["f1"],
+                "Threshold": best_total_adj["thresh_value"],
             },
+            epoch # Added epoch here so it plots correctly on the x-axis
         )
 
         self.tb_writer.flush()
 
-        preds = best_predictions.int().numpy()
-        best_threshold = best_threshold.numpy()
-        total_pred_scores = total_pred_scores.cpu().numpy() 
-        total_half_cur_scores = total_half_cur_scores.cpu().numpy()
-        total_first_cur_scores = total_first_cur_scores.cpu().numpy()
-        total_scores = total_scores.cpu().numpy()
-        total_maha_eps = total_maha_eps.cpu().numpy()
-        total_cos_eps = total_cos_eps.cpu().numpy()
-        total_maha_res = total_maha_res.cpu().numpy()
-        total_cos_res = total_cos_res.cpu().numpy()
-        total_res_scores = total_res_scores.cpu().numpy()
-        labels = best_labels_final.int().numpy()
+        # Reconstruct the best predictions array to dump into the text file
+        best_threshold = best_total_adj["thresh_value"]
+        best_raw_predictions = (total_scores >= best_threshold).float().cpu().numpy()
+        
+        # adjust_preds returns a Tensor, so we call .numpy() on it
+        preds = self.adjust_preds(best_raw_predictions, total_labels.cpu().numpy()).numpy() 
+        labels = total_labels.cpu().int().numpy()
+
+        # Ensure all score arrays are moved to CPU and converted to numpy for writing
+        total_pred_scores_np = total_pred_scores.cpu().numpy() 
+        total_half_cur_scores_np = total_half_cur_scores.cpu().numpy()
+        total_first_cur_scores_np = total_first_cur_scores.cpu().numpy()
+        total_scores_np = total_scores.cpu().numpy()
+        total_maha_eps_np = total_maha_eps.cpu().numpy()
+        total_cos_eps_np = total_cos_eps.cpu().numpy()
+        total_maha_res_np = total_maha_res.cpu().numpy()
+        total_cos_res_np = total_cos_res.cpu().numpy()
+        total_res_scores_np = total_res_scores.cpu().numpy()
+        
         limit = len(preds)
-        with open(f"logs/{epoch}.txt", "w") as f:
+        
+        with open(f"logs/{self.dataset}.txt", "w") as f:
             f.write(f"epoch: {epoch}\n")
             f.write(f"threshold: {best_threshold}\n")
             anomaly_counter = -1
@@ -649,54 +769,54 @@ class Solver():
                 if preds[i] == 1 and labels[i] == 0:
                     f.write(
                         f"False Positive | index: {i} | "
-                        f"total_cond_scores: {total_scores[i]} | "
-                        f"total_half_scores: {total_half_cur_scores[i]} | "
-                        f"total_first_scores: {total_first_cur_scores[i]} | "
-                        f"epsilon: {total_pred_scores[i]} | "
-                        f"residual: {total_res_scores[i]} | "
-                        f"maha_eps: {total_maha_eps[i]} | "
-                        f"maha_res: {total_maha_res[i]} | "
-                        f"cos_eps: {total_cos_eps[i]} | "
-                        f"cos_res: {total_cos_res[i]}\n"
+                        f"total_cond_scores: {total_scores_np[i]} | "
+                        f"total_half_scores: {total_half_cur_scores_np[i]} | "
+                        f"total_first_scores: {total_first_cur_scores_np[i]} | "
+                        f"epsilon: {total_pred_scores_np[i]} | "
+                        f"residual: {total_res_scores_np[i]} | "
+                        f"maha_eps: {total_maha_eps_np[i]} | "
+                        f"maha_res: {total_maha_res_np[i]} | "
+                        f"cos_eps: {total_cos_eps_np[i]} | "
+                        f"cos_res: {total_cos_res_np[i]}\n"
                     )
                 if preds[i] == 0 and labels[i] == 1:
                     f.write(
                         f"False Negative | index: {i} | "
-                        f"total_cond_scores: {total_scores[i]} | "
-                        f"total_half_scores: {total_half_cur_scores[i]} | "
-                        f"total_first_scores: {total_first_cur_scores[i]} | "
-                        f"epsilon: {total_pred_scores[i]} | "
-                        f"residual: {total_res_scores[i]} | "
-                        f"maha_eps: {total_maha_eps[i]} | "
-                        f"maha_res: {total_maha_res[i]} | "
-                        f"cos_eps: {total_cos_eps[i]} | "
-                        f"cos_res: {total_cos_res[i]}\n"
+                        f"total_cond_scores: {total_scores_np[i]} | "
+                        f"total_half_scores: {total_half_cur_scores_np[i]} | "
+                        f"total_first_scores: {total_first_cur_scores_np[i]} | "
+                        f"epsilon: {total_pred_scores_np[i]} | "
+                        f"residual: {total_res_scores_np[i]} | "
+                        f"maha_eps: {total_maha_eps_np[i]} | "
+                        f"maha_res: {total_maha_res_np[i]} | "
+                        f"cos_eps: {total_cos_eps_np[i]} | "
+                        f"cos_res: {total_cos_res_np[i]}\n"
                     )
                 if preds[i] == 1 and labels[i] == 1:
                     f.write(
                         f"True Positive | index: {i} | "
-                        f"total_cond_scores: {total_scores[i]} | "
-                        f"total_half_scores: {total_half_cur_scores[i]} | "
-                        f"total_first_scores: {total_first_cur_scores[i]} | "
-                        f"epsilon: {total_pred_scores[i]} | "
-                        f"residual: {total_res_scores[i]} | "
-                        f"maha_eps: {total_maha_eps[i]} | "
-                        f"maha_res: {total_maha_res[i]} | "
-                        f"cos_eps: {total_cos_eps[i]} | "
-                        f"cos_res: {total_cos_res[i]}\n"
+                        f"total_cond_scores: {total_scores_np[i]} | "
+                        f"total_half_scores: {total_half_cur_scores_np[i]} | "
+                        f"total_first_scores: {total_first_cur_scores_np[i]} | "
+                        f"epsilon: {total_pred_scores_np[i]} | "
+                        f"residual: {total_res_scores_np[i]} | "
+                        f"maha_eps: {total_maha_eps_np[i]} | "
+                        f"maha_res: {total_maha_res_np[i]} | "
+                        f"cos_eps: {total_cos_eps_np[i]} | "
+                        f"cos_res: {total_cos_res_np[i]}\n"
                     )
                 if preds[i] == 0 and labels[i] == 0:
                     f.write(
                         f"True Negative | index: {i} | "
-                        f"total_cond_scores: {total_scores[i]} | "
-                        f"total_half_scores: {total_half_cur_scores[i]} | "
-                        f"total_first_scores: {total_first_cur_scores[i]} | "
-                        f"epsilon: {total_pred_scores[i]} | "
-                        f"residual: {total_res_scores[i]} | "
-                        f"maha_eps: {total_maha_eps[i]} | "
-                        f"maha_res: {total_maha_res[i]} | "
-                        f"cos_eps: {total_cos_eps[i]} | "
-                        f"cos_res: {total_cos_res[i]}\n"
+                        f"total_cond_scores: {total_scores_np[i]} | "
+                        f"total_half_scores: {total_half_cur_scores_np[i]} | "
+                        f"total_first_scores: {total_first_cur_scores_np[i]} | "
+                        f"epsilon: {total_pred_scores_np[i]} | "
+                        f"residual: {total_res_scores_np[i]} | "
+                        f"maha_eps: {total_maha_eps_np[i]} | "
+                        f"maha_res: {total_maha_res_np[i]} | "
+                        f"cos_eps: {total_cos_eps_np[i]} | "
+                        f"cos_res: {total_cos_res_np[i]}\n"
                     )
 
         #preds = best_raw_predictions.int().numpy()
@@ -710,85 +830,5 @@ class Solver():
         #        if i % 96 == 0:
         #            anomaly_counter += 1
         #        if preds[i] == 1 and labels[i] == 0:
-        #            f.write(
-        #                f"False Positive | index: {i} | "
-        #                f"total_cond_scores: {total_scores[i]} | "
-        #                f"total_half_scores: {total_half_cur_scores[i]} | "
-        #                f"total_first_scores: {total_first_cur_scores[i]} | "
-        #                f"epsilon: {total_pred_scores[i]} | "
-        #                f"residual: {total_res_scores[i]} | "
-        #                f"pca1_eps: {total_pca1[i]} | "
-        #                f"pca2_eps: {total_pca2[i]} | "
-        #                f"pca1_res: {total_pca1_res[i]} | "
-        #                f"pca2_res: {total_pca2_res[i]} | "
-        #                f"maha_eps: {total_maha_eps[i]} | "
-        #                f"maha_res: {total_maha_res[i]} | "
-        #                f"cos_eps: {total_cos_eps[i]} | "
-        #                f"cos_res: {total_cos_res[i]}\n"
-        #            )
-        #        if preds[i] == 0 and labels[i] == 1:
-        #            f.write(
-        #                f"False Negative | index: {i} | "
-        #                f"total_cond_scores: {total_scores[i]} | "
-        #                f"total_half_scores: {total_half_cur_scores[i]} | "
-        #                f"total_first_scores: {total_first_cur_scores[i]} | "
-        #                f"epsilon: {total_pred_scores[i]} | "
-        #                f"residual: {total_res_scores[i]} | "
-        #                f"pca1_eps: {total_pca1[i]} | "
-        #                f"pca2_eps: {total_pca2[i]} | "
-        #                f"pca1_res: {total_pca1_res[i]} | "
-        #                f"pca2_res: {total_pca2_res[i]} | "
-        #                f"maha_eps: {total_maha_eps[i]} | "
-        #                f"maha_res: {total_maha_res[i]} | "
-        #                f"cos_eps: {total_cos_eps[i]} | "
-        #                f"cos_res: {total_cos_res[i]}\n"
-        #            )
-        #        if preds[i] == 1 and labels[i] == 1:
-        #            f.write(
-        #                f"True Positive | index: {i} | "
-        #                f"total_cond_scores: {total_scores[i]} | "
-        #                f"total_half_scores: {total_half_cur_scores[i]} | "
-        #                f"total_first_scores: {total_first_cur_scores[i]} | "
-        #                f"epsilon: {total_pred_scores[i]} | "
-        #                f"residual: {total_res_scores[i]} | "
-        #                f"pca1_eps: {total_pca1[i]} | "
-        #                f"pca2_eps: {total_pca2[i]} | "
-        #                f"pca1_res: {total_pca1_res[i]} | "
-        #                f"pca2_res: {total_pca2_res[i]} | "
-        #                f"maha_eps: {total_maha_eps[i]} | "
-        #                f"maha_res: {total_maha_res[i]} | "
-        #                f"cos_eps: {total_cos_eps[i]} | "
-        #                f"cos_res: {total_cos_res[i]}\n"
-        #            )
-        #        if preds[i] == 0 and labels[i] == 0:
-        #            f.write(
-        #                f"True Negative | index: {i} | "
-        #                f"total_cond_scores: {total_scores[i]} | "
-        #                f"total_half_scores: {total_half_cur_scores[i]} | "
-        #                f"total_first_scores: {total_first_cur_scores[i]} | "
-        #                f"epsilon: {total_pred_scores[i]} | "
-        #                f"residual: {total_res_scores[i]} | "
-        #                f"pca1_eps: {total_pca1[i]} | "
-        #                f"pca2_eps: {total_pca2[i]} | "
-        #                f"pca1_res: {total_pca1_res[i]} | "
-        #                f"pca2_res: {total_pca2_res[i]} | "
-        #                f"maha_eps: {total_maha_eps[i]} | "
-        #                f"maha_res: {total_maha_res[i]} | "
-        #                f"cos_eps: {total_cos_eps[i]} | "
-        #                f"cos_res: {total_cos_res[i]}\n"
-        #            )
+        #            f.write(...)
 
-
-    def save_model(self, names : 'Diffusion'):
-        folder = "trained_models"
-        #torch.save(self.autoencoder.state_dict(), f"{folder}/{names[0]}.pth")
-        print(f"Saved PyTorch Model State to {names}.pth")
-        torch.save(self.diff_model.state_dict(), f"{folder}/{names}.pth")
-
-    def load_model(self, names: list[str] = [f'AE', f'Diffusion']):
-        names = [f"{name}_{self.model_name}" for name in names]
-        folder = "trained_models"
-        #self.autoencoder.to(self.device)
-        #self.autoencoder.load_state_dict(torch.load(f"{folder}/{names[0]}.pth"))
-        self.diff_model.to(self.device)
-        self.diff_model.load_state_dict(torch.load(f"{folder}/{names[1]}.pth"))

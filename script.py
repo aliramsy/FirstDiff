@@ -41,6 +41,8 @@ CHANNELS = {'MSL': 55, 'SMAP': 25,  'SWaT': 51, 'PSM': 25, 'SMD' : 38}
 datasets = ["SWaT", "MSL", "PSM", "SMD", "SMAP"]
 
 for dataset in datasets:
+    torch.manual_seed(42)
+    np.random.seed(42)
     if dataset in ['SWaT', 'PSM']:
         df = pd.read_csv(TRAIN_PATH[dataset])
         if dataset == 'PSM':
@@ -55,12 +57,12 @@ for dataset in datasets:
     scaler.fit(train_raw)
 
     if dataset in ['SWaT', 'PSM']:
-        #train_encoder = TrainDatasetCSV(TRAIN_PATH[dataset], scaler, None, WINDOW_SIZE_TRAIN, STRIDE_TRAIN, 0.85)
+        train_encoder = TrainDatasetCSV(TRAIN_PATH[dataset], scaler, None, WINDOW_SIZE_TRAIN, STRIDE_TRAIN, 0.85)
         train = TrainDatasetCSV(TRAIN_PATH[dataset], scaler, None, WINDOW_SIZE, STRIDE_TRAIN, 0.85)
         val = ValDatasetCSV(TRAIN_PATH[dataset], scaler, None, WINDOW_SIZE, STRIDE, 0.85)
         test = TestDatasetCSV(TEST_PATH[dataset], TEST_LABEL_PATH[dataset], scaler, None, WINDOW_SIZE, STRIDE, 1.0)
     else:
-        #train_encoder = TrainDataset(TRAIN_PATH[dataset], scaler, None, WINDOW_SIZE_TRAIN, STRIDE_TRAIN, 0.85)
+        train_encoder = TrainDataset(TRAIN_PATH[dataset], scaler, None, WINDOW_SIZE_TRAIN, STRIDE_TRAIN, 0.85)
         train = TrainDataset(TRAIN_PATH[dataset], scaler, None, WINDOW_SIZE, STRIDE_TRAIN, 0.85)
         val = ValDataset(TRAIN_PATH[dataset], scaler, None, WINDOW_SIZE, STRIDE, 0.85)
         test = TestDataset(TEST_PATH[dataset], TEST_LABEL_PATH[dataset], scaler, None, WINDOW_SIZE, STRIDE, 1.0)
@@ -69,7 +71,7 @@ for dataset in datasets:
     val_dataloader = DataLoader(val, batch_size=BATCH_SIZE, shuffle=False, pin_memory=True)
     test_dataloader = DataLoader(test, batch_size=BATCH_SIZE, shuffle=False, pin_memory=True)
 
-    #train_dataloader_encoder = DataLoader(train_encoder, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True, drop_last=True)
+    train_dataloader_encoder = DataLoader(train_encoder, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True, drop_last=True)
 
     if torch.cuda.is_available():
         device = f'cuda:{GPU_ID}'
@@ -78,7 +80,7 @@ for dataset in datasets:
 
     channels = CHANNELS[dataset]
     #spectral_encoder = SpectralSignatureEncoder(num_sensors=CHANNELS[dataset], hidden_dim=D_MODEL, window_size=WINDOW_SIZE_TRAIN)
-    #pretrain_spectral_encoder(encoder=spectral_encoder, train_loader=train_dataloader_encoder, device=device, epochs=500)
+    #pretrain_spectral_encoder(encoder=spectral_encoder, train_loader=train_dataloader_encoder, device=device, epochs=1000)
 
     #dit_model = TimeSeriesDiT(target_seq_len=WINDOW_SIZE,num_sensors=CHANNELS[dataset],hidden_dim=D_MODEL,num_layers=DiT_num_layers).to(device)
 
@@ -91,13 +93,20 @@ for dataset in datasets:
     #history_model = HistoryEncoderPerceiver(seq_len= HISTORY_SIZE, in_channels=CHANNELS[dataset], num_latents=32, d_model=D_MODEL, nhead=8)
     #history_model = HistoryEncoderViT(seq_len= HISTORY_SIZE, in_channels=CHANNELS[dataset], num_patches=32, d_model=D_MODEL)
 
-    uncdit = UnconditionalTimeSeriesDiT(target_seq_len=WINDOW_SIZE, num_sensors=channels, hidden_dim=D_MODEL, num_heads=8, num_layers=DiT_num_layers)
+    uncdit = UnconditionalTimeSeriesDiT(target_seq_len=WINDOW_SIZE, num_sensors=channels, hidden_dim=D_MODEL, num_heads=8, num_layers=DiT_num_layers).to(device)
 
     experiment = {"dataset": dataset, "noise_steps": NOISE_STEPS, "epochs": EPOCHS, "batch_size": BATCH_SIZE, "window_size": WINDOW_SIZE, 'info': INFO}
 
-    solver = Solver(dit_model, train_dataloader, val_dataloader, test_dataloader, 
+    solver = Solver(uncdit, train_dataloader, val_dataloader, test_dataloader, 
                    diffusion=diffusion, mask_data=False, experiment=experiment, 
-                   device=device, gpu_id=GPU_ID)
+                   device=device, gpu_id=GPU_ID, dataset = dataset)
     solver.train(EPOCHS)
+
+    del solver
+    del uncdit
+    #del dit_model
+    del diffusion
+    #del spectral_encoder
+    torch.cuda.empty_cache()
     #solver.load_model()
     #solver.test()
