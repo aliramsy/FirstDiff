@@ -5,7 +5,7 @@ from sklearn.covariance import LedoitWolf
 from torch.utils.tensorboard import SummaryWriter
 from torcheval.metrics.functional import binary_f1_score, binary_precision, binary_recall
 from model.Diffusion import *
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, precision_recall_curve, auc
 
 class Solver():
     # add autoencoder to the init function it is after self
@@ -276,6 +276,18 @@ class Solver():
                     preds[i] = 1
         return torch.from_numpy(preds).type(torch.float32)
     
+    def compute_range_auc_pr(self, labels, scores):
+        try:
+            # labels and scores are moved to cpu for sklearn
+            y_true = labels.cpu().numpy()
+            y_scores = scores.cpu().numpy()
+            
+            precision, recall, _ = precision_recall_curve(y_true, y_scores)
+            return auc(recall, precision)
+        except Exception as e:
+            print(f"Error computing R-AUC-PR: {e}")
+            return 0.0
+    
     def calculate_add(self, raw_predict, actual):
         """
         Calculates the Anomaly Detection Delay (ADD).
@@ -475,14 +487,16 @@ class Solver():
             labels = labels.to(self.device)
 
             # ---- FIX: R-AUC computed ONCE (not per threshold) ----
-            rauc = self.compute_range_auc_roc(labels, score_tensor)
+            rauc_roc = self.compute_range_auc_roc(labels, score_tensor)
+            rauc_pr = self.compute_range_auc_pr(labels, score_tensor)
 
             best = {
                 "f1": 0.0,
                 "p": 0.0,
                 "r": 0.0,
                 "add": 0.0,
-                "rauc": rauc,
+                "rauc": rauc_roc,
+                "rauc_pr": rauc_pr, # NEW
                 "thresh_ratio": 0.0,
                 "thresh_value": 0.0
             }
@@ -527,7 +541,8 @@ class Solver():
                         "p": float(p),
                         "r": float(r),
                         "add": float(add),
-                        "rauc": float(rauc),
+                        "rauc": float(rauc_roc),
+                        "rauc_pr": float(rauc_pr), # NEW
                         "thresh_ratio": float(ratio.item()),
                         "thresh_value": float(thresh_value.item())
                     }
@@ -611,10 +626,18 @@ class Solver():
 
             # Calculate one consistent ROC for the combined signal
             continuous_rauc = self.compute_range_auc_roc(total_labels, combined_continuous_scores)
+            continuous_rauc_pr = self.compute_range_auc_pr(total_labels, combined_continuous_scores)
             # ========================================================
 
             # Initialize best_combo with the continuous ROC
-            best_combo = {"f1": 0.0, "p": 0.0, "r": 0.0, "add": 0.0, "rauc": float(continuous_rauc)}
+            best_combo = {
+                "f1": 0.0, 
+                "p": 0.0, 
+                "r": 0.0, 
+                "add": 0.0, 
+                "rauc": float(continuous_rauc),
+                "rauc_pr": float(continuous_rauc_pr) # NEW
+            }
 
             lbls = total_labels.to(self.device)
 
@@ -639,11 +662,12 @@ class Solver():
 
                     # Calculate F1 to find the best threshold pair
                     f1 = binary_f1_score(preds_final, lbls.int())
+# Inside combination_search(base_name, other_name, adjusted=True):
+# ... inside the nested for loops ...
 
                     if f1 > best_combo["f1"]:
                         p = binary_precision(preds_final, lbls.int())
                         r = binary_recall(preds_final, lbls.int())
-                        # ADD uses RAW predictions (no adjustment)
                         add = self.calculate_add(preds_raw.detach().cpu().numpy(), lbls.detach().cpu().numpy())
 
                         best_combo = {
@@ -651,7 +675,8 @@ class Solver():
                             "p": float(p),
                             "r": float(r),
                             "add": float(add),
-                            "rauc": float(continuous_rauc), # Still uses the continuous value
+                            "rauc": float(continuous_rauc),
+                            "rauc_pr": float(continuous_rauc_pr),  # <-- ADD THIS LINE
                             "ratio1": r1,
                             "ratio2": r2
                         }
@@ -692,6 +717,8 @@ class Solver():
                     f.write(f"F1: {adj['f1']}\n")
                     f.write(f"ADD: {adj['add']}\n")
                     f.write(f"R-AUC-ROC: {adj['rauc']}\n")
+                    f.write(f"R-AUC-PR: {adj['rauc_pr']}\n")
+                    
         
                     # ---------- RAW ----------
                     f.write(f"\n[{name.upper()} - RAW]\n")
@@ -700,7 +727,8 @@ class Solver():
                     f.write(f"Recall: {raw['r']}\n")
                     f.write(f"F1: {raw['f1']}\n")
                     f.write(f"ADD: {raw['add']}\n")
-                    f.write(f"R-AUC-ROC: {raw['rauc']}\n")
+                    f.write(f"R-AUC-ROC: {adj['rauc']}\n")
+                    f.write(f"R-AUC-PR: {adj['rauc_pr']}\n")
         
         
                 # =========================
@@ -717,6 +745,8 @@ class Solver():
                     f.write(f"  R-AUC-ROC: {v['rauc']:.4f}\n")
                     f.write(f"  Ratio1: {v['ratio1']}\n")
                     f.write(f"  Ratio2: {v['ratio2']}\n")
+                    f.write(f"  R-AUC-ROC: {v['rauc']:.4f}\n")
+                    f.write(f"  R-AUC-PR: {v['rauc_pr']:.4f}\n")
 
 
         # =========================

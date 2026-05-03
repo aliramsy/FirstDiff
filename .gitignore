@@ -2,8 +2,6 @@
 **/*.png
 trained_models
 datasets/
-logs
-rawlogs
 runs
-logs1
-rawlogs1
+*log*/
+

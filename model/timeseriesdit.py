@@ -257,9 +257,9 @@ class TimeSeriesDiT(nn.Module):
         # -------------------------
         # coarse + timestep fusion (FIXED scaling)
         # -------------------------
-		tyle = self.coarse_encoder(x_curr)
+		style = self.coarse_encoder(x_curr)
         #t_emb_raw = self.t_embedder(t)
-        t_emb = self.t_embedder(t)
+        t_emb = self.t_embedder(t) + style
 
         # 2. FUSE THEM through the layer instead of simple addition
         # This provides a much richer 'c' vector for the AdaLN
