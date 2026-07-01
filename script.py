@@ -25,6 +25,7 @@ GPU_ID = 0
 EPOCHS = 15
 NOISE_STEPS = 100
 HISTORY_SIZE = 1024
+HEAD_NUMBER = 8
 DiT_num_layers = 6
 RUN = 1
 INFO = f"GAT_SA_EXPTMP_TMPTMP_DEL_RUN_{RUN}"
@@ -94,7 +95,7 @@ for i in range(6):
         #history_model = HistoryEncoderPerceiver(seq_len= HISTORY_SIZE, in_channels=CHANNELS[dataset], num_latents=32, d_model=D_MODEL, nhead=8)
         #history_model = HistoryEncoderViT(seq_len= HISTORY_SIZE, in_channels=CHANNELS[dataset], num_patches=32, d_model=D_MODEL)
 
-        uncdit = UnconditionalTimeSeriesDiT(target_seq_len=WINDOW_SIZE, num_sensors=channels, hidden_dim=D_MODEL, num_heads=8, num_layers=DiT_num_layers).to(device)
+        uncdit = UnconditionalTimeSeriesDiT(target_seq_len=WINDOW_SIZE, num_sensors=channels, hidden_dim=D_MODEL, num_heads=HEAD_NUMBER, num_layers=DiT_num_layers).to(device)
 
         experiment = {"dataset": dataset, "noise_steps": NOISE_STEPS, "epochs": EPOCHS, "batch_size": BATCH_SIZE, "window_size": WINDOW_SIZE, 'info': INFO}
 

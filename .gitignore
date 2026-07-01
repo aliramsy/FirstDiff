@@ -4,4 +4,9 @@ trained_models
 datasets/
 runs
 *log*/
-
+**/__pycache__/
+smap/
+psm/
+*.zip
+*.pth
+*.csv

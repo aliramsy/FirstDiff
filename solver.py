@@ -5,7 +5,9 @@ from sklearn.covariance import LedoitWolf
 from torch.utils.tensorboard import SummaryWriter
 from torcheval.metrics.functional import binary_f1_score, binary_precision, binary_recall
 from model.Diffusion import *
-from sklearn.metrics import roc_auc_score, precision_recall_curve, auc
+from sklearn.metrics import auc
+import numpy as np
+from vus.metrics import get_metrics
 
 class Solver():
     # add autoencoder to the init function it is after self
@@ -108,12 +110,13 @@ class Solver():
             self.optimizer = torch.optim.Adam(list(self.autoencoder.parameters()) + list(self.diff_model.parameters()), lr=1e-3)
         else:
             self.optimizer = torch.optim.Adam(self.diff_model.parameters(), lr=1e-3)
-
+            self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.95)
         for epoch in range(epochs):
             #self.autoencoder.train()
             self.diff_model.train()
 
             avg_loss = self.train_one_epoch(epoch)
+            self.scheduler.step()
  
             avg_vloss = self.val(epoch)
             self.tb_writer.add_scalars('Loss', {"Train" : avg_loss, "Val" : avg_vloss}, epoch)
@@ -276,17 +279,6 @@ class Solver():
                     preds[i] = 1
         return torch.from_numpy(preds).type(torch.float32)
     
-    def compute_range_auc_pr(self, labels, scores):
-        try:
-            # labels and scores are moved to cpu for sklearn
-            y_true = labels.cpu().numpy()
-            y_scores = scores.cpu().numpy()
-            
-            precision, recall, _ = precision_recall_curve(y_true, y_scores)
-            return auc(recall, precision)
-        except Exception as e:
-            print(f"Error computing R-AUC-PR: {e}")
-            return 0.0
     
     def calculate_add(self, raw_predict, actual):
         """
@@ -326,13 +318,52 @@ class Solver():
                 
         return sum(delays) / len(delays) if len(delays) > 0 else 0.0
     
-    def compute_range_auc_roc(self, labels, scores):
-        try:
-            return roc_auc_score(labels.cpu().numpy(), scores.cpu().numpy())
-        except:
-            return 0.0
+    def _get_anomaly_ranges(self, labels):
+        """Helper to extract start and end indices of continuous anomaly segments."""
+        diff = np.diff(np.insert(labels, 0, 0))
+        starts = np.where(diff == 1)[0]
+        ends = np.where(diff == -1)[0]
+        if len(ends) < len(starts):
+            ends = np.append(ends, len(labels))
+        return list(zip(starts, ends))
 
-    
+    from vus.metrics import get_metrics
+
+
+    def compute_range_metrics(self, labels, scores):
+        """Computes standardized VLDB 2022 Range-AUC and VUS metrics."""
+        try:
+            y_true = labels.detach().cpu().numpy().astype(int).flatten()
+            y_scores = scores.detach().cpu().numpy().astype(float).flatten()            
+
+            # Dynamically find the median anomaly length to set the sliding window buffer
+            diff = np.diff(np.concatenate([[0], y_true, [0]]))
+            starts = np.where(diff == 1)[0]
+            ends = np.where(diff == -1)[0]
+            lengths = ends - starts
+            sliding_window = (
+                max(int(np.median(lengths)), 16)
+                if len(lengths) > 0
+                else 100
+            )
+
+            # Compute all official benchmark metrics simultaneously
+            metrics = get_metrics(
+                score=y_scores,
+                labels=y_true,
+                metric="all",
+                slidingWindow=sliding_window,
+            )
+
+            return {
+                "rauc_roc": float(metrics["R_AUC_ROC"]),
+                "rauc_pr": float(metrics["R_AUC_PR"]),
+                "vus_roc": float(metrics["VUS_ROC"]),
+                "vus_pr": float(metrics["VUS_PR"]),
+            }
+        except Exception as e:
+            print(f"Error computing VUS metrics: {e}")
+            return {"rauc_roc": 0.0, "rauc_pr": 0.0, "vus_roc": 0.0, "vus_pr": 0.0}
 
     
     def test(self, epoch):
@@ -486,19 +517,19 @@ class Solver():
             score_tensor = score_tensor.to(self.device)
             labels = labels.to(self.device)
 
-            # ---- FIX: R-AUC computed ONCE (not per threshold) ----
-            rauc_roc = self.compute_range_auc_roc(labels, score_tensor)
-            rauc_pr = self.compute_range_auc_pr(labels, score_tensor)
+            vus_dict = self.compute_range_metrics(labels, score_tensor)
 
             best = {
                 "f1": 0.0,
                 "p": 0.0,
                 "r": 0.0,
                 "add": 0.0,
-                "rauc": rauc_roc,
-                "rauc_pr": rauc_pr, # NEW
+                "rauc": vus_dict["rauc_roc"],
+                "rauc_pr": vus_dict["rauc_pr"],
+                "vus_roc": vus_dict["vus_roc"],
+                "vus_pr": vus_dict["vus_pr"],
                 "thresh_ratio": 0.0,
-                "thresh_value": 0.0
+                "thresh_value": 0.0,
             }
 
             all_results = []
@@ -541,8 +572,12 @@ class Solver():
                         "p": float(p),
                         "r": float(r),
                         "add": float(add),
-                        "rauc": float(rauc_roc),
-                        "rauc_pr": float(rauc_pr), # NEW
+
+                        "rauc": vus_dict["rauc_roc"],
+                        "rauc_pr": vus_dict["rauc_pr"],
+                        "vus_roc": vus_dict["vus_roc"],
+                        "vus_pr": vus_dict["vus_pr"],
+
                         "thresh_ratio": float(ratio.item()),
                         "thresh_value": float(thresh_value.item())
                     }
@@ -611,9 +646,7 @@ class Solver():
             base_neighbors = get_neighbors(base_results, base_best)
             other_neighbors = get_neighbors(other_results, other_best)
 
-            # ========================================================
-            # NEW: CONTINUOUS ROC CALCULATION (BEFORE LOOP)
-            # ========================================================
+            # === FIX: Moved normalization block to the top of the function scope ===
             s1 = score_dict[base_name]
             s2 = score_dict[other_name]
 
@@ -621,22 +654,29 @@ class Solver():
             s1_norm = (s1 - s1.min()) / (s1.max() - s1.min() + 1e-12)
             s2_norm = (s2 - s2.min()) / (s2.max() - s2.min() + 1e-12)
 
-            # Create combined continuous scores
             combined_continuous_scores = s1_norm + s2_norm
 
-            # Calculate one consistent ROC for the combined signal
-            continuous_rauc = self.compute_range_auc_roc(total_labels, combined_continuous_scores)
-            continuous_rauc_pr = self.compute_range_auc_pr(total_labels, combined_continuous_scores)
-            # ========================================================
+            # Calculate range metrics safely using the fully resolved score matrix
+            vus_metrics = self.compute_range_metrics(
+                total_labels,
+                combined_continuous_scores
+            )
 
-            # Initialize best_combo with the continuous ROC
+            continuous_rauc = vus_metrics["rauc_roc"]
+            continuous_rauc_pr = vus_metrics["rauc_pr"]
+            continuous_vus_roc = vus_metrics["vus_roc"]
+            continuous_vus_pr = vus_metrics["vus_pr"]
+
+            # Initialize best_combo dictionary
             best_combo = {
-                "f1": 0.0, 
-                "p": 0.0, 
-                "r": 0.0, 
-                "add": 0.0, 
+                "f1": 0.0,
+                "p": 0.0,
+                "r": 0.0,
+                "add": 0.0,
                 "rauc": float(continuous_rauc),
-                "rauc_pr": float(continuous_rauc_pr) # NEW
+                "rauc_pr": float(continuous_rauc_pr),
+                "vus_roc": float(continuous_vus_roc),
+                "vus_pr": float(continuous_vus_pr)
             }
 
             lbls = total_labels.to(self.device)
@@ -649,7 +689,6 @@ class Solver():
                     thresh2 = torch.quantile(s2, 1. - r2)
                     preds2 = s2 >= thresh2
 
-                    # OR fusion (exactly the same as v >= 1)
                     preds_raw = (preds1 | preds2).float()
 
                     if adjusted:
@@ -660,10 +699,7 @@ class Solver():
                     else:
                         preds_final = preds_raw
 
-                    # Calculate F1 to find the best threshold pair
                     f1 = binary_f1_score(preds_final, lbls.int())
-# Inside combination_search(base_name, other_name, adjusted=True):
-# ... inside the nested for loops ...
 
                     if f1 > best_combo["f1"]:
                         p = binary_precision(preds_final, lbls.int())
@@ -676,7 +712,9 @@ class Solver():
                             "r": float(r),
                             "add": float(add),
                             "rauc": float(continuous_rauc),
-                            "rauc_pr": float(continuous_rauc_pr),  # <-- ADD THIS LINE
+                            "rauc_pr": float(continuous_rauc_pr),
+                            "vus_roc": float(continuous_vus_roc),
+                            "vus_pr": float(continuous_vus_pr),
                             "ratio1": r1,
                             "ratio2": r2
                         }
@@ -696,7 +734,7 @@ class Solver():
             combo_results[f"total+{name}_raw"] = combination_search("total", name, adjusted=False)
 
         if epoch == 14:
-            with open("log.txt", "a") as f:
+            with open("log_roc.txt", "a") as f:
             
                 f.write(f"\n===== Epoch {epoch} BEST RESULTS =====\n")
                 f.write(f"\n===== dataset {self.dataset} BEST RESULTS =====\n")
@@ -718,6 +756,8 @@ class Solver():
                     f.write(f"ADD: {adj['add']}\n")
                     f.write(f"R-AUC-ROC: {adj['rauc']}\n")
                     f.write(f"R-AUC-PR: {adj['rauc_pr']}\n")
+                    f.write(f"VUS-ROC: {adj['vus_roc']}\n")
+                    f.write(f"VUS-PR: {adj['vus_pr']}\n")
                     
         
                     # ---------- RAW ----------
@@ -729,6 +769,8 @@ class Solver():
                     f.write(f"ADD: {raw['add']}\n")
                     f.write(f"R-AUC-ROC: {adj['rauc']}\n")
                     f.write(f"R-AUC-PR: {adj['rauc_pr']}\n")
+                    f.write(f"VUS-ROC: {adj['vus_roc']}\n")
+                    f.write(f"VUS-PR: {adj['vus_pr']}\n")
         
         
                 # =========================
@@ -789,7 +831,7 @@ class Solver():
         
         limit = len(preds)
         
-        with open(f"logs/{self.dataset}.txt", "w") as f:
+        with open(f"logs/{self.dataset}_num.txt", "w") as f:
             f.write(f"epoch: {epoch}\n")
             f.write(f"threshold: {best_threshold}\n")
             anomaly_counter = -1
