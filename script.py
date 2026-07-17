@@ -14,7 +14,7 @@ from model.uncdit import UnconditionalTimeSeriesDiT
 #from model.vit_encoder import HistoryEncoderViT
 #from model.timeseriesdit import TimeSeriesDiT
 #from model.mrdd import MRDDFrequencyDecomposer
-from model.clt import SpectralSignatureEncoder, pretrain_spectral_encoder
+#from model.clt import SpectralSignatureEncoder, pretrain_spectral_encoder
 
 BATCH_SIZE = 128
 WINDOW_SIZE = 96
@@ -41,7 +41,7 @@ CHANNELS = {'MSL': 55, 'SMAP': 25,  'SWaT': 51, 'PSM': 25, 'SMD' : 38}
 
 datasets = ["SWaT", "MSL", "PSM", "SMD", "SMAP"]
 
-for i in range(6):
+for i in range(2):
     for dataset in datasets:
         torch.manual_seed(42)
         np.random.seed(42)

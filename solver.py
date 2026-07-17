@@ -2,7 +2,7 @@ import torch.nn.functional as F
 import torch
 from sklearn.decomposition import PCA
 from sklearn.covariance import LedoitWolf
-from torch.utils.tensorboard import SummaryWriter
+#from torch.utils.tensorboard import SummaryWriter
 from torcheval.metrics.functional import binary_f1_score, binary_precision, binary_recall
 from model.Diffusion import *
 from sklearn.metrics import auc
@@ -33,7 +33,7 @@ class Solver():
         else:
             self.device = device
         
-        self.tb_writer = SummaryWriter(self.experiment_name)
+        #self.tb_writer = SummaryWriter(self.experiment_name)
 
     def calculate_mask(self, input, output, window_size, batch_size, dim):
         """
@@ -119,7 +119,7 @@ class Solver():
             self.scheduler.step()
  
             avg_vloss = self.val(epoch)
-            self.tb_writer.add_scalars('Loss', {"Train" : avg_loss, "Val" : avg_vloss}, epoch)
+            #self.tb_writer.add_scalars('Loss', {"Train" : avg_loss, "Val" : avg_vloss}, epoch)
             print(f"EPOCH {epoch} LOSS train {avg_loss} valid {avg_vloss}")
             if epoch == epochs - 1:
                 self.test(epoch)
@@ -127,7 +127,7 @@ class Solver():
             #if epoch % 5 == 0 and epoch !=0:
             #    self.save_model([f'AE_{epoch}', f'Diffusion_{epoch}'])
 
-        self.tb_writer.flush()
+        #self.tb_writer.flush()
         #self.save_model(f'Diffusion_{epoch}')
 
     
@@ -138,7 +138,7 @@ class Solver():
             self.diff_model.eval()
 
             predicted_noise = self.diff_model(x_curr=x, t=t)
-            if j == self.diffusion.noise_steps - 10:
+            if j == self.diffusion.noise_steps - 1:
                 ret_predicted_noise_cond = predicted_noise.clone()
 
             if j % 100 == 0:
@@ -734,7 +734,7 @@ class Solver():
             combo_results[f"total+{name}_raw"] = combination_search("total", name, adjusted=False)
 
         if epoch == 14:
-            with open("log_roc.txt", "a") as f:
+            with open("log_roc_first.txt", "a") as f:
             
                 f.write(f"\n===== Epoch {epoch} BEST RESULTS =====\n")
                 f.write(f"\n===== dataset {self.dataset} BEST RESULTS =====\n")
@@ -797,18 +797,18 @@ class Solver():
         # We will use the 'total' score's best adjusted results as the main anchor for plotting and logs.
         best_total_adj = results["total"]["adj"]
 
-        self.tb_writer.add_scalars(
-            "Scores_Total_Adj",
-            {
-                "P": best_total_adj["p"],
-                "R": best_total_adj["r"],
-                "F1": best_total_adj["f1"],
-                "Threshold": best_total_adj["thresh_value"],
-            },
-            epoch # Added epoch here so it plots correctly on the x-axis
-        )
-
-        self.tb_writer.flush()
+        #self.tb_writer.add_scalars(
+        #    "Scores_Total_Adj",
+        #    {
+        #        "P": best_total_adj["p"],
+        #        "R": best_total_adj["r"],
+        #        "F1": best_total_adj["f1"],
+        #        "Threshold": best_total_adj["thresh_value"],
+        #    },
+        #    epoch # Added epoch here so it plots correctly on the x-axis
+        #)
+#
+        #self.tb_writer.flush()
 
         # Reconstruct the best predictions array to dump into the text file
         best_threshold = best_total_adj["thresh_value"]
@@ -831,7 +831,7 @@ class Solver():
         
         limit = len(preds)
         
-        with open(f"logs/{self.dataset}_num.txt", "w") as f:
+        with open(f"logs/{self.dataset}_num_first.txt", "w") as f:
             f.write(f"epoch: {epoch}\n")
             f.write(f"threshold: {best_threshold}\n")
             anomaly_counter = -1
