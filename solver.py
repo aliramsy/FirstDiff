@@ -10,12 +10,11 @@ import numpy as np
 from vus.metrics import get_metrics
 
 class Solver():
-    # add autoencoder to the init function it is after self
-    def __init__(self, diff_model, train_loader, val_loader, test_loader, diffusion=None, mask_data=True, anomaly_ratio=0.05, experiment=None, device='cuda', gpu_id=0, decomposer = None, dataset = None):
+    def __init__(self, diff_model, train_loader, val_loader, test_loader, diffusion=None, anomaly_ratio=0.05, experiment=None, device='cuda', gpu_id=0, decomposer = None, dataset = None, enumer = None):
         #self.autoencoder = autoencoder
         self.decomposer = decomposer
         self.dataset = dataset
-        self.mask_data = mask_data
+        self.enumer = enumer
         self.diff_model = diff_model
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -35,17 +34,6 @@ class Solver():
         
         #self.tb_writer = SummaryWriter(self.experiment_name)
 
-    def calculate_mask(self, input, output, window_size, batch_size, dim):
-        """
-        Greater score corresponds to possible anomalies
-        """
-        scores = torch.square((output - input))
-        scores_reshaped = scores.reshape(-1, window_size)
-        scores_sorted, _ =  torch.sort(scores_reshaped, dim=1)
-        thres_ind = int(0.95 * window_size)
-        threshold_values = scores_sorted[:, thres_ind].view(batch_size, dim, 1)
-        return (scores < threshold_values).type(torch.float32)
-
     def train_one_epoch(self, epoch_index):
         running_loss = 0.
         last_loss = 0.
@@ -57,16 +45,7 @@ class Solver():
             
             self.optimizer.zero_grad()
             
-            if self.mask_data:
-                #outputs = self.autoencoder(inputs)
-                pass
-
-            ### Data masking
-            if self.mask_data:
-                mask = self.calculate_mask(inputs, outputs, inputs.shape[2], inputs.shape[0], inputs.shape[1])
-                ae_x = mask * inputs + (1. - mask) * torch.rand_like(inputs)
-            else:
-                ae_x = inputs
+            ae_x = inputs
 
             if self.decomposer:
                 x_low, x_mid, x_high = self.decomposer(ae_x)
@@ -85,14 +64,7 @@ class Solver():
 
 
             diff_loss = self.loss_fn(predicted_noise, noise)
-            ####### DIFFUSION
-            if self.mask_data:
-                loss = self.alpha * diff_loss
-            else:
-                loss = diff_loss
-
-            if self.mask_data:
-                loss += self.loss_fn(outputs, inputs)
+            loss = diff_loss
 
             loss.backward()
             
@@ -106,11 +78,9 @@ class Solver():
     def train(self, epochs):
         #self.autoencoder.to(self.device)
         self.diff_model.to(self.device)
-        if self.mask_data:
-            self.optimizer = torch.optim.Adam(list(self.autoencoder.parameters()) + list(self.diff_model.parameters()), lr=1e-3)
-        else:
-            self.optimizer = torch.optim.Adam(self.diff_model.parameters(), lr=1e-3)
-            self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.95)
+
+        self.optimizer = torch.optim.Adam(self.diff_model.parameters(), lr=1e-3)
+        self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.95)
         for epoch in range(epochs):
             #self.autoencoder.train()
             self.diff_model.train()
@@ -179,17 +149,7 @@ class Solver():
             for i, vdata in enumerate(self.val_loader):
                 vinputs = vdata
                 vinputs = vinputs.to(self.device)
-
-                if self.mask_data:
-                    #voutputs = self.autoencoder(vinputs)
-                    pass
-
-                ### Data masking
-                if self.mask_data:
-                    mask = self.calculate_mask(vinputs, voutputs, vinputs.shape[2], vinputs.shape[0], vinputs.shape[1])
-                    ae_x = mask * vinputs + (1. - mask) * torch.rand_like(vinputs)
-                else:
-                    ae_x = vinputs
+                ae_x = vinputs
             
                 ##### DIFFUSION
                 if self.decomposer:
@@ -214,8 +174,6 @@ class Solver():
 
                 ####### DIFFUSION
                 vloss = F.mse_loss(diff_voutputs, ae_x)
-                if self.mask_data:
-                    vloss += self.loss_fn(voutputs, vinputs)
                 running_vloss += vloss.item()
 
         all_pred_eps = torch.cat(all_pred_eps, dim=0)
@@ -282,41 +240,48 @@ class Solver():
     
     def calculate_add(self, raw_predict, actual):
         """
-        Calculates the Anomaly Detection Delay (ADD).
-        """
-        # If they are already numpy arrays, skip the .is_cuda check
-        if isinstance(raw_predict, torch.Tensor):
-            if raw_predict.is_cuda:
-                raw_predict = raw_predict.cpu()
-            raw_predict = raw_predict.numpy()
-            
-        if isinstance(actual, torch.Tensor):
-            if actual.is_cuda:
-                actual = actual.cpu()
-            actual = actual.numpy()
+        Calculates Anomaly Detection Delay (ADD).
     
-        # Now use numpy logic for the diff
-        import numpy as np
-        diff = np.diff(actual, prepend=0.0)
-        
+        Every ground-truth anomaly segment contributes.
+    
+        If an anomaly is never detected, its delay equals the
+        full length of the anomaly segment.
+        """
+    
+        if isinstance(raw_predict, torch.Tensor):
+            raw_predict = raw_predict.detach().cpu().numpy()
+    
+        if isinstance(actual, torch.Tensor):
+            actual = actual.detach().cpu().numpy()
+    
+        diff = np.diff(actual, prepend=0)
+    
         starts = np.where(diff == 1)[0]
         ends = np.where(diff == -1)[0]
-        
+    
         if len(ends) < len(starts):
             ends = np.append(ends, len(actual))
-            
+    
         if len(starts) == 0:
             return 0.0
     
         delays = []
+    
         for s, e in zip(starts, ends):
+        
             segment_preds = raw_predict[s:e]
-            first_hit_idx = np.argmax(segment_preds)
-            
-            if segment_preds[first_hit_idx] == 1:
-                delays.append(first_hit_idx)
-                
-        return sum(delays) / len(delays) if len(delays) > 0 else 0.0
+    
+            hits = np.where(segment_preds == 1)[0]
+    
+            if len(hits) > 0:
+                delay = hits[0]
+            else:
+                # Missed anomaly
+                delay = e - s
+    
+            delays.append(delay)
+    
+        return float(np.mean(delays))
     
     def _get_anomaly_ranges(self, labels):
         """Helper to extract start and end indices of continuous anomaly segments."""
@@ -380,6 +345,11 @@ class Solver():
         total_cos_res = torch.empty(0).to(self.device)
         total_res_scores = torch.empty(0).to(self.device) 
 
+        if self.enumer == 10:
+            total_x_vectors = torch.empty(0, device=self.device) 
+            total_eps_vectors = torch.empty(0, device=self.device)
+            all_residual_data = torch.empty(0).to(self.device)
+
 
         all_inputs = []
         all_outputs = []
@@ -391,21 +361,7 @@ class Solver():
                 tinputs = tinputs.to(self.device)
                 labels = labels.to(self.device)
 
-                if self.mask_data:
-                    #toutputs = self.autoencoder(tinputs)
-                    pass
-
-                if self.mask_data:
-                    mask = self.calculate_mask(
-                        tinputs,
-                        toutputs,
-                        tinputs.shape[2],
-                        tinputs.shape[0],
-                        tinputs.shape[1],
-                    )
-                    ae_x = mask * tinputs + (1. - mask) * torch.rand_like(tinputs)
-                else:
-                    ae_x = tinputs
+                ae_x = tinputs
 
                 if self.decomposer:
                     x_low, x_mid, x_high = self.decomposer(ae_x)
@@ -433,6 +389,18 @@ class Solver():
                 pred_eps = predicted_noise.reshape(B * T, D)
                 eps_flat = eps.reshape(B * T, D)   
                 residual = eps_flat - pred_eps
+
+                # To collect high-dim data:
+                if self.enumer == 10:
+                    ae_x_flat = ae_x.reshape(B * T, D)
+                    if total_x_vectors.numel() == 0:
+                        total_x_vectors = ae_x_flat
+                        total_eps_vectors = pred_eps
+                        all_residual_data = residual
+                    else:
+                        total_x_vectors = torch.cat([total_x_vectors, ae_x_flat], dim=0)
+                        total_eps_vectors = torch.cat([total_eps_vectors, pred_eps], dim=0)
+                        all_residual_data = torch.cat([all_residual_data, residual], dim=0)
 
                 # Epsilon Mahalanobis
                 diff_eps = pred_eps - self.mu_eps
@@ -500,9 +468,6 @@ class Solver():
                 )
 
                 tloss = F.mse_loss(diff_toutputs, ae_x)
-
-                if self.mask_data:
-                    tloss += self.loss_fn(toutputs, tinputs)
 
                 running_tloss += tloss.item()
 
@@ -727,14 +692,24 @@ class Solver():
         # =========================
         combo_results = {}
 
-        pairs = ["epsilon", "residual", "cos_res", "cos_eps", "maha_res"]
+        pairs = ["epsilon", "residual", "cos_res", "cos_eps", "maha_res", "maha_eps"]
 
         for name in pairs:
             combo_results[f"total+{name}_adj"] = combination_search("total", name, adjusted=True)
             combo_results[f"total+{name}_raw"] = combination_search("total", name, adjusted=False)
 
+        metric_pairs = [
+            ("epsilon", "maha_eps"),
+            ("maha_eps", "cos_eps"),
+            ("epsilon", "cos_eps"),
+        ]
+        
+        for m1, m2 in metric_pairs:
+            combo_results[f"{m1}+{m2}_adj"] = combination_search(m1, m2, adjusted=True)
+            combo_results[f"{m1}+{m2}_raw"] = combination_search(m1, m2, adjusted=False)
+
         if epoch == 14:
-            with open("log_roc_first.txt", "a") as f:
+            with open("log_roc_first_mah_add_vuc.txt", "a") as f:
             
                 f.write(f"\n===== Epoch {epoch} BEST RESULTS =====\n")
                 f.write(f"\n===== dataset {self.dataset} BEST RESULTS =====\n")
@@ -785,11 +760,33 @@ class Solver():
                     f.write(f"  Recall: {v['r']:.4f}\n")
                     f.write(f"  ADD: {v['add']:.2f}\n")
                     f.write(f"  R-AUC-ROC: {v['rauc']:.4f}\n")
+                    f.write(f"  R-AUC-PR: {v['rauc_pr']}\n")
                     f.write(f"  Ratio1: {v['ratio1']}\n")
                     f.write(f"  Ratio2: {v['ratio2']}\n")
-                    f.write(f"  R-AUC-ROC: {v['rauc']:.4f}\n")
-                    f.write(f"  R-AUC-PR: {v['rauc_pr']:.4f}\n")
+                    f.write(f"  VUS-ROC: {v['vus_roc']}\n")
+                    f.write(f"  VUS-PR: {v['vus_pr']}\n")
 
+
+            # ==========================================
+            # EXPORT HIGH-DIMENSIONAL DATA FOR VISUALIZATION
+            # ==========================================
+            # Flatten and move tensors safely to CPU numpy arrays
+            if self.enumer == 10:
+                x_flat_np = total_x_vectors.detach().cpu().numpy()     
+                eps_flat_np = total_eps_vectors.detach().cpu().numpy() 
+                res_flat_np = all_residual_data.detach().cpu().numpy()
+                labels_np = total_labels.detach().cpu().numpy().astype(int) 
+
+
+                export_filename = f"high_dim_data_{self.dataset}_epoch_{epoch}.npz"
+                np.savez_compressed(
+                    export_filename,
+                    x_data=x_flat_np,
+                    eps_data=eps_flat_np,
+                    res_data=res_flat_np,
+                    labels=labels_np,
+                    dataset_name=str(self.dataset) 
+                )
 
         # =========================
         # FIX: TENSORBOARD & FILE LOGGING
@@ -903,4 +900,3 @@ class Solver():
         #            anomaly_counter += 1
         #        if preds[i] == 1 and labels[i] == 0:
         #            f.write(...)
-

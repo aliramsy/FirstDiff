@@ -10,3 +10,4 @@ psm/
 *.zip
 *.pth
 *.csv
+**/*.npz

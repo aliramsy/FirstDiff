@@ -122,3 +122,54 @@ class UnconditionalTimeSeriesDiT(nn.Module):
         out = self.head(x) # (B, 96, 51)
         
         return out
+
+#if __name__ == "__main__":
+#  
+#    def count_parameters(model):
+#      """Returns total, trainable, and non-trainable parameter counts."""
+#      total = sum(p.numel() for p in model.parameters())
+#      trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+#      non_trainable = total - trainable
+#      return total, trainable, non_trainable
+#
+#
+#    def print_layer_breakdown(model):
+#      """Prints learnable parameter counts for top-level modules and their sum."""
+#      print(f"{'Module Name':<20} | {'Learnable Params':<16}")
+#      print("-" * 41)
+#
+#      total_learnable = 0
+#      for name, module in model.named_children():
+#        # Sum only parameters that require gradients
+#        params = sum(p.numel() for p in module.parameters() if p.requires_grad)
+#        total_learnable += params
+#        print(f"{name:<20} | {params:>16,}")
+#
+#      print("-" * 41)
+#      print(f"{'TOTAL SUM':<20} | {total_learnable:>16,}")
+#
+#    model = UnconditionalTimeSeriesDiT(
+#        target_seq_len=96,
+#        num_sensors=51,
+#        hidden_dim=256,
+#        num_heads=8,
+#        num_layers=6,
+#    )   
+#    # Calculate parameter counts
+#    total, trainable, non_trainable = count_parameters(model)   
+#    print("=" * 45)
+#    print("         MODEL PARAMETER SUMMARY         ")
+#    print("=" * 45)
+#    print(f"Total Parameters:         {total:>12,}")
+#    print(f"Trainable Parameters:     {trainable:>12,}")
+#    print(f"Non-Trainable Parameters: {non_trainable:>12,}")
+#    print("=" * 45)
+#    print("\nLayer-by-Layer Breakdown:")
+#    print_layer_breakdown(model)    
+#    # Verify execution with a dummy input batch
+#    batch_size = 4
+#    dummy_x = torch.randn(batch_size, 96, 51)  # (Batch, Seq_Len, Sensors)
+#    dummy_t = torch.randint(0, 1000, (batch_size,))  # Random timesteps 
+#    output = model(dummy_x, dummy_t)
+#    print("\n" + "=" * 45)
+#    print(f"Forward Pass Output Shape: {output.shape}")

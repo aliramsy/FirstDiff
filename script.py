@@ -39,9 +39,9 @@ TEST_LABEL_PATH = {'MSL': "datasets/MSL/MSL_test_label.npy", 'SMAP': "datasets/S
         'PSM': "datasets/PSM/test_label.csv", 'SMD':"datasets/SMD/test_label.npy"}
 CHANNELS = {'MSL': 55, 'SMAP': 25,  'SWaT': 51, 'PSM': 25, 'SMD' : 38}
 
-datasets = ["SWaT", "MSL", "PSM", "SMD", "SMAP"]
+datasets = ["SMD", "SMAP", "SWaT", "MSL", "PSM"]
 
-for i in range(2):
+for i in range(3):
     for dataset in datasets:
         torch.manual_seed(42)
         np.random.seed(42)
@@ -100,8 +100,8 @@ for i in range(2):
         experiment = {"dataset": dataset, "noise_steps": NOISE_STEPS, "epochs": EPOCHS, "batch_size": BATCH_SIZE, "window_size": WINDOW_SIZE, 'info': INFO}
 
         solver = Solver(uncdit, train_dataloader, val_dataloader, test_dataloader, 
-                    diffusion=diffusion, mask_data=False, experiment=experiment, 
-                    device=device, gpu_id=GPU_ID, dataset = dataset)
+                    diffusion=diffusion, experiment=experiment, 
+                    device=device, gpu_id=GPU_ID, dataset = dataset, enumer= i)
         solver.train(EPOCHS)
 
         del solver
